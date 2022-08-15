@@ -43,7 +43,7 @@ def assert_allclose(x, y, rtol=1e-4, atol=1e-4):
         np.testing.assert_allclose(x, y, rtol, atol)
     elif isinstance(x, TrainState):
         assert isinstance(y, TrainState)
-        assert_allclose(jax.tree_leaves(x), jax.tree_leaves(y))
+        assert_allclose(jax.tree_leaves(x), jax.tree_leaves(y), rtol, atol)
     elif x == y:
         return
     else:
