@@ -26,11 +26,9 @@ from operator import attrgetter
 import os
 import pickle
 import shutil
-from struct import pack
 import threading
 import time
 from typing import Any, List, Union, Sequence, Tuple, Optional
-from alpa.collective.collective import get_participated_streams
 
 from jax import core, xla, device_put
 from jax._src.api import ShapeDtypeStruct
@@ -137,15 +135,10 @@ class MeshHostWorker:
             raise NotImplementedError(
                 f"backend {global_config.backend} is not supported")
         # Monkey patch the backend
-        # print(self.backend)
         set_override_backend(self.backend)
-        # print(-1)
         # self.initialize_streams_for_groups(self.backend)
         self.local_devices = self.backend.local_devices()
-        # print(self.local_devices)
         self.num_devices = len(self.local_devices)
-        
-        # initialize_memory()
 
         self.buffers = {}  # Dict[uuid -> Sequence[DeviceArray]]
         self.buffers_done_events = {} # Dict[uuid -> List[event]]
@@ -162,7 +155,7 @@ class MeshHostWorker:
         self.set_runtime_random_seed(runtime_random_seed)
 
         if global_config.pipeline_use_signal_send_recv:
-            # print("Use signal send recv for debugging.")
+            print("Use signal send recv for debugging.")
             self.signal_buffers = []
             for d in self.local_devices:
                 jax_tensor = device_put(jnp.ones((1,), dtype=jnp.int8), d)
@@ -180,7 +173,6 @@ class MeshHostWorker:
                     datas: Sequence[np.ndarray],
                     num_batch=1,
                     batch_dim=0):
-        # print("put buffers: ", uuids)
         assert len(datas) == self.num_devices
         if not isinstance(uuids, Iterable):
             uuids = [uuids]
@@ -207,7 +199,6 @@ class MeshHostWorker:
     def shard_and_put_non_zero_buffer(self, uuids: Union[Sequence[int], int],
                                       shape: Sequence[int], dtype: np.dtype,
                                       indices: Sequence, num_batch: int):
-        # print("put buffers: ", uuids)
         if isinstance(uuids, int):
             uuids = [uuids]
         assert len(uuids) == num_batch
@@ -264,7 +255,8 @@ class MeshHostWorker:
             if global_config.enable_overlapping:# and uuids in self.buffers_done_events:
                 del self.buffers_done_events[uuids]
 
-    def block_until_ready_buffers(self, uuids: Union[Sequence[int], int]): # TODO(hexu): do we need synchronize events here? 
+    def block_until_ready_buffers(self, uuids: Union[Sequence[int], int]):
+        # TODO(hexu): we need synchronize events here
         # We have to block all buffers to avoid the last operation is
         # cross-mesh resharding(not SPMD)
         if isinstance(uuids, Iterable):
@@ -450,8 +442,8 @@ class MeshHostWorker:
 
     def get_devices_and_events(self, tile_specs, ary_uuid):
         
-        participated_devices = sorted(list(set([
-            tile_spec.device_id for tile_spec in tile_specs])))
+        participated_devices = sorted(set([
+            tile_spec.device_id for tile_spec in tile_specs]))
         if ary_uuid in self.buffers_done_events:
             inputs_done_events = [self.buffers_done_events[ary_uuid][device_id]
                                 for device_id in participated_devices]
@@ -490,7 +482,6 @@ class MeshHostWorker:
                 #TODO(hexu): will we continue to use it after sending it to other devices?
 
     def run_resharding_recv_task(self, uuid, ary_uuid, set_empty_buffer=True):
-        # print(-1)
         task: ReshardingRecvTask = self.recv_tasks[uuid]
         if set_empty_buffer and ary_uuid not in self.buffers:
             self.buffers[ary_uuid] = [None] * self.num_devices
@@ -533,12 +524,6 @@ class MeshHostWorker:
         if global_config.enable_overlapping:
             for device_id, stream in zip(participated_devices, participated_streams):
                 self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
-                # print(f"mark event {ary_uuid} {device_id} -> {self.buffers_done_events[ary_uuid][device_id]}")
-
-            # for stream in participated_streams:
-            # for stream in col.get_all_streams(task.group_name):
-            #     xe.synchronize_stream(stream)
-            # self.sync_all()
 
     def send_tile(self, uuid: int, device_id: int, offset: Sequence[slice],
                   dst_rank: int, dst_gpu_idx: int, group_name: str):
@@ -633,7 +618,6 @@ class MeshHostWorker:
                                                participated_streams):
                 self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
                 # TODO(hexu): I might have to create two events for both streams. 
-        
 
     ##### Profiling and Debugging Related Functions #####
     def profile_hlo_ops(self, op_infos: Sequence[Any], cache_filename: str,
