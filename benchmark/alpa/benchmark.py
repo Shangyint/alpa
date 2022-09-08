@@ -70,7 +70,6 @@ def benchmark_suite(suite_name,
         num_micro_batches = benchmark_case.num_micro_batches
         parallel_args = benchmark_case.parallel_args
 
-        # niter = 1
         # Run one case
         print("Working on case: {}".format(str(benchmark_case)))
         result = benchmark_one_case(
