@@ -41,7 +41,6 @@ import cupy
 
 import alpa
 from alpa.global_env import global_config, is_worker
-from alpa.collective.collective_group import nccl_util
 from alpa.monkey_patch import (restore_random, monkey_patch_random,
                                rng_primitives, override_get_backend)
 from alpa.wrapped_hlo import HloStatus, WrappedHlo
@@ -1757,6 +1756,7 @@ def mark_events(streams, devices):
 
 def mark_event(stream, device_id):
     if isinstance(stream, cupy.cuda.Stream):# never use this. return cupy.cuda.event
+        from alpa.collective.collective_group import nccl_util
         with nccl_util.Device(device_id):
             event = cupy.cuda.Event()
         event.record(stream)

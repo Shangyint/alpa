@@ -568,7 +568,6 @@ class MeshHostWorker:
                                       uuid,
                                       ary_uuid,
                                       set_empty_buffer=True):
-        return # TODO(hexu): buggy
         task: ReshardingBroadcastTask = self.broadcast_tasks[uuid]
         broadcast_specs = task.broadcast_specs
         if set_empty_buffer and ary_uuid not in self.buffers:
@@ -581,27 +580,25 @@ class MeshHostWorker:
                 for device_id in range(self.num_devices)
             ]
             self.buffers_done_events[ary_uuid] = None
-            #TODO(hexu): add events?
 
         if global_config.enable_overlapping:
-            participated_devices = []
-            for _, broadcast_spec in broadcast_specs.items():
-                participated_devices.extend(broadcast_spec.devices_ids)
-            participated_devices = sorted(list(set(participated_devices)))
+            participated_devices = set()
+            for broadcast_spec in broadcast_specs.values():
+                participated_devices.update(broadcast_spec.devices_ids)
+            # TODO: add some assertion to avoid incompatible state
+            participated_devices = sorted(participated_devices)
 
             inputs_done_events = (
-                [self.buffers_done_events[ary_uuid][device_id]
-                for device_id in participated_devices]
+                self.buffers_done_events[ary_uuid][device_id]
+                for device_id in participated_devices
             )
-
-            input_or_output_streams = [True]*len(participated_devices)
-            participated_streams = (
-                col.get_participated_streams(participated_devices,
-                                            input_or_output_streams,
-                                            task.group_name)
-                )
+            # The rank 0 should use output streams
+            is_receiver = broadcast_spec.devices_global_rank[0] != 0
+            input_or_output_streams = [is_receiver] * len(participated_devices)
+            participated_streams = col.get_participated_streams(
+                participated_devices, input_or_output_streams, task.group_name)
             synchronize_inputs_done_events([inputs_done_events],
-                                            participated_streams[0])
+                                            participated_streams)
 
 
         for group_idx in broadcast_specs:
@@ -614,8 +611,8 @@ class MeshHostWorker:
                                        broadcast_spec.tensor_slices,
                                        task.group_name)
         if global_config.enable_overlapping:
-            for device_id, stream in enumerate(broadcast_spec.devices_ids,
-                                               participated_streams):
+            for device_id, stream in zip(participated_devices,
+                                         participated_streams):
                 self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
                 # TODO(hexu): I might have to create two events for both streams. 
 
