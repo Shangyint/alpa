@@ -585,7 +585,6 @@ class MeshHostWorker:
             participated_devices = set()
             for broadcast_spec in broadcast_specs.values():
                 participated_devices.update(broadcast_spec.devices_ids)
-            # TODO: add some assertion to avoid incompatible state
             participated_devices = sorted(participated_devices)
 
             inputs_done_events = (
@@ -593,6 +592,7 @@ class MeshHostWorker:
                 for device_id in participated_devices
             )
             # The rank 0 should use output streams
+            # TODO: add some assertion to avoid incompatible state
             is_receiver = broadcast_spec.devices_global_rank[0] != 0
             input_or_output_streams = [is_receiver] * len(participated_devices)
             participated_streams = col.get_participated_streams(

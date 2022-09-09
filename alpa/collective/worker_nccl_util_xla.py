@@ -149,6 +149,13 @@ def broadcast(worker, uuid, comm_key, world_size, devices_ids,
             else:
                 tmp = device_put(jnp.ones(slice_shape, dtype=buffer.dtype),
                                  worker.local_devices[device_id])
+            allgather_stream = col.get_stream(group_name, device_id,
+                                              global_rank != 0)
+            working_stream = xe.fetch_working_streams_from_pyclient(
+                worker.backend)[device_id]
+
+            event = mark_event(working_stream, device_id)
+            synchronize_one_event(event, allgather_stream)
             local_start_pos_list.append(0)
             buffers.append(jax_tensor_to_xla_buffer(tmp))
 
@@ -168,6 +175,10 @@ def broadcast(worker, uuid, comm_key, world_size, devices_ids,
         else:
             start_indices = tuple(
                 ind_in_dst.start for ind_in_dst in tensor_slice)
+            allgather_stream = col.get_stream(group_name, device_id,
+                                              global_rank != 0)
+            event = mark_event(allgather_stream, device_id)
+            synchronize_one_event(event, working_stream)
             new_buffer = jax_tensor_set(xla_buffer_to_jax_tensor(buffer),
                                         xla_buffer_to_jax_tensor(xla_buffer),
                                         start_indices)
