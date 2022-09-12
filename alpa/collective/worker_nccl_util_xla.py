@@ -13,6 +13,7 @@ from alpa.util import (jax_tensor_set, jax_tensor_index,
                        xla_buffer_to_jax_tensor, jax_tensor_to_xla_buffer,
                        is_continuous_subset, infer_offset_and_n_elements,
                        infer_start_pos_and_n_elements, mark_event, synchronize_one_event)
+from alpa.pipeline_parallel.xla_custom_call_marker import dummy_compute_on_default_stream
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -42,6 +43,7 @@ def send_tile(worker, uuid: int, device_id: int, offset: Sequence[slice],
                                       start_indices, slice_sizes)
         to_send = jax_tensor_to_xla_buffer(src_buffer)
         n_elements = np.prod(slice_sizes)
+        # dummy_compute_on_default_stream(device_id)
 
         send_stream = col.get_stream(group_name, device_id, False)
         working_stream = xe.fetch_working_streams_from_pyclient(worker.backend)[device_id]
@@ -79,11 +81,11 @@ def recv_tile(worker, uuid: int, device_id: int,
         recv_stream = col.get_stream(group_name, device_id, True)
         working_stream = xe.fetch_working_streams_from_pyclient(worker.backend)[device_id]
         # device_put uses d2d stream on src_device
-        stream = xe.fetch_d2d_stream(worker.backend, 0)
+        d2d_stream = xe.fetch_d2d_stream(worker.backend, 0)
 
         event = mark_event(working_stream, device_id)
         synchronize_one_event(event, recv_stream)
-        event = mark_event(stream, 0)
+        event = mark_event(d2d_stream, 0)
         synchronize_one_event(event, recv_stream)
 
         col.recv_multigpu(to_recv,
