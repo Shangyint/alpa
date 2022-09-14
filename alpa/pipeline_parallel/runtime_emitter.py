@@ -397,13 +397,15 @@ class PipelineInstEmitter:
         instruction_costs = {}
         for worker, insts in self.instruction_lists.items():
             instruction_costs[worker] = []
-        pass 
+        pass
         # TODO(hexu): finish this
         return instruction_costs
 
-    def _optimize_instructions_order(self, instruction_lists, executable_config_lists):
-        instruction_costs = self._profile_instructions(instruction_lists, executable_config_lists)
-        
+    def _optimize_instructions_order(self, instruction_lists,
+                                     executable_config_lists):
+        instruction_costs = self._profile_instructions(instruction_lists,
+                                                       executable_config_lists)
+
         pass
 
     def compile(self):
@@ -439,7 +441,6 @@ class PipelineInstEmitter:
                                         instruction_lists, executable_uuids,
                                         executable_config_lists)
         # self._optimize_instructions_order(instruction_lists, executable_config_lists)
-
 
         # Compile concate
         self._compile_concate(instruction_lists, executable_config_lists)
@@ -522,11 +523,11 @@ class PipelineInstEmitter:
             src_idx, src_uuid = list(
                 self.env.get_var_meshes(invar, batch_idx).items())[0]
             resharding_task = self._resharding_tasks[src_idx][mesh_idx][var_key]
-            
+
             # self.mesh_instructions[src_idx].append(("resharding", resharding_task))
             # self.mesh_instructions_interval[src_idx].append({worker:[-1,-1] for worker in src_idx.worker})
             # TODO(hexu): finish this.
-            
+
             if global_config.resharding_mode == "send_recv":
                 self._compile_resharding_task(src_uuid, resharding_task,
                                               recv_uuid, instruction_lists)
@@ -534,6 +535,46 @@ class PipelineInstEmitter:
                 self._compile_broadcast_resharding_task(
                     self.mesh_group[src_idx], src_uuid, resharding_task,
                     recv_uuid, instruction_lists)
+
+    def _compile_exec_one_mesh(self, mesh_idx, task, executable_uuids,
+                               donation_mapping, worker_tmp_instructions):
+        batch_idx, stage_idx = task
+        physical_mesh = self.mesh_group[mesh_idx]
+        stage = self.stages[stage_idx]
+        for outvar in stage.outvars:
+            # get uuids of this outvar
+            output_uuid = self._get_next_uuids(1)[0]
+            self.env.set_var_mesh_uuid(outvar, batch_idx, mesh_idx, output_uuid)
+
+        exec_uuid = executable_uuids[stage_idx]
+        donated_invars = self.stages[stage_idx].donated_invars
+
+        input_uuids = np.zeros((len(stage.invars),), dtype=np.int64)
+        output_uuids = np.zeros((len(stage.outvars),), dtype=np.int64)
+        for idx, invar in enumerate(stage.invars):
+            input_uuids[idx] = self.env.get_var_mesh_uuid(
+                invar, batch_idx, mesh_idx)
+        for idx, outvar in enumerate(stage.outvars):
+            output_uuids[idx] = self.env.get_var_mesh_uuid(
+                outvar, batch_idx, mesh_idx)
+        for idx in range(len(stage.invars)):
+            if donated_invars[idx]:
+                donation_mapping[mesh_idx].update(input_uuids[idx],
+                                                  output_uuids[idx])
+
+        for worker in physical_mesh.workers:
+            kwargs = {
+                "skip_grad_sync": self.schedule.should_skip_grad_sync(task),
+                "sync_before": False,
+                "sync_after": False,
+            }
+
+            worker_tmp_instructions[worker].append(
+                PipelineInstruction.run(exec_uuid,
+                                        input_uuids,
+                                        output_uuids,
+                                        kwargs,
+                                        info=f"stage {stage_idx}"))
 
     def _compile_exec_one_tick(self, sched, donation_mapping, instruction_lists,
                                executable_uuids, executable_config_lists):
@@ -545,7 +586,6 @@ class PipelineInstEmitter:
         for mesh_idx, task in enumerate(sched):
             if not task:
                 continue
-            physical_mesh = self.mesh_group[mesh_idx]
             batch_idx, stage_idx = task
             stage = self.stages[stage_idx]
             # shard_args for intermediates
@@ -572,42 +612,9 @@ class PipelineInstEmitter:
                                              executable_config_lists)
 
             # execute
-            # allocate uuids for buffers created by RUN
-            for outvar in stage.outvars:
-                # get uuids of this outvar
-                output_uuid = self._get_next_uuids(1)[0]
-                self.env.set_var_mesh_uuid(outvar, batch_idx, mesh_idx,
-                                           output_uuid)
-
-            exec_uuid = executable_uuids[stage_idx]
-            donated_invars = self.stages[stage_idx].donated_invars
-
-            input_uuids = np.zeros((len(stage.invars),), dtype=np.int64)
-            output_uuids = np.zeros((len(stage.outvars),), dtype=np.int64)
-            for idx, invar in enumerate(stage.invars):
-                input_uuids[idx] = self.env.get_var_mesh_uuid(
-                    invar, batch_idx, mesh_idx)
-            for idx, outvar in enumerate(stage.outvars):
-                output_uuids[idx] = self.env.get_var_mesh_uuid(
-                    outvar, batch_idx, mesh_idx)
-            for idx in range(len(stage.invars)):
-                if donated_invars[idx]:
-                    donation_mapping[mesh_idx].update(input_uuids[idx],
-                                                      output_uuids[idx])
-
-            for worker in physical_mesh.workers:
-                kwargs = {
-                    "skip_grad_sync": self.schedule.should_skip_grad_sync(task),
-                    "sync_before": False,
-                    "sync_after": False,
-                }
-
-                worker_tmp_instructions[worker].append(
-                    PipelineInstruction.run(exec_uuid,
-                                            input_uuids,
-                                            output_uuids,
-                                            kwargs,
-                                            info=f"stage {stage_idx}"))
+            self._compile_exec_one_mesh(mesh_idx, task, executable_uuids,
+                                        donation_mapping,
+                                        worker_tmp_instructions)
 
         for worker, worker_instruction in worker_tmp_instructions.items():
             instruction_lists[worker].extend(worker_instruction)
@@ -1134,3 +1141,68 @@ class PipelineInstEmitter:
             cannot_free_uuids.update(input_uuids)
             new_list.append(instruction)
         return list(reversed(new_list))
+
+
+class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Based on stage info, generate cross-mesh communication requirements
+        # This formulates what send task is required
+        # Dict[int, Dict[int, Tuple(List, List)]]
+        # src_mesh_idx -> (dst_mesh_idx -> (Vars, Sharding Specs))
+        self.stage_send_vars = [{} for _ in range(self.num_mesh)]
+
+    def _get_stage_send_vars(self):
+        var_defined = {}
+        var_at_mesh = {}
+        global_invar_set = set(self.global_invars)
+        # mesh_idx -> set of stage_idx
+        for stage_idx, stage in enumerate(self.stages):
+            assert len(self.schedule.stage_placement(stage_idx)) == 1
+            mesh_idx = list(self.schedule.stage_placement(stage_idx))[0]
+            for var_idx, var in enumerate(stage.invars):
+                if var in global_invar_set or mesh_idx in var_at_mesh[var]:
+                    continue
+                else:
+                    # Currently we use the first mesh, since there is almost no
+                    # redundant computation and the first sends earlier. If the
+                    # var is required multiple times, then we might need round-
+                    # robin to avoid congestion.
+                    src_mesh_idx = list(var_defined[var])[0]
+                    # once the var is received, it is permanent stored. Maybe
+                    # we will can an option to config it.
+                    var_at_mesh[var].add(mesh_idx)
+                    # insert the recv task
+                    var_and_specs = self.stage_send_vars[
+                        src_mesh_idx].setdefault(mesh_idx, ([], []))
+                    var_and_specs[0].append(var)
+                    var_and_specs[1].append(stage.input_sharding_specs[var_idx])
+
+            for var in stage.outvars:
+                var_defined.setdefault(var, OrderedSet()).add(stage_idx)
+                var_at_mesh.setdefault(var, OrderedSet()).add(mesh_idx)
+
+    def _compile_exec_one_tick(self, sched, donation_mapping, instruction_lists,
+                               executable_uuids, executable_config_lists):
+        for mesh_idx, task in enumerate(sched):
+            if not task:
+                continue
+            # execute
+            self._compile_exec_one_mesh(mesh_idx, task, executable_uuids,
+                                        donation_mapping, instruction_lists)
+        # send immediately after the result is created.
+        # we use another iteration to launch exec before alloc zero for recv
+        for mesh_idx, task in enumerate(sched):
+            if not task:
+                continue
+            batch_idx, stage_idx = task
+            if len(self.stage_send_vars[stage_idx]) > 0:
+                for receiver_idx in self.stage_send_vars[stage_idx]:
+                    (received_vars, received_sharding_specs
+                    ) = self.stage_send_vars[stage_idx][receiver_idx]
+                    self._compile_get_vars_from_mesh(received_vars,
+                                                     received_sharding_specs,
+                                                     receiver_idx, batch_idx,
+                                                     instruction_lists,
+                                                     executable_config_lists)
