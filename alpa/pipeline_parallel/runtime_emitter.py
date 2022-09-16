@@ -53,7 +53,7 @@ class PipelineInstruction:
     output_uuids: Optional[np.ndarray]
     opaques: Optional[Dict[str, Any]]
     info: str
-    print_uuids: bool = False
+    print_uuids: bool = True
 
     @classmethod
     def run(cls, task_uuid, input_uuids, output_uuids, kwargs, info=""):  # noqa
@@ -113,7 +113,7 @@ class PipelineInstruction:
                    output_uuids=None,
                    opaques=None,
                    info=info,
-                   print_uuids=False)
+                   print_uuids=True)
 
     def __str__(self):
         ret = ""
@@ -516,7 +516,7 @@ class PipelineInstEmitter:
         recv_uuid_list = self._compile_alloc(invars, dst_specs, mesh_idx,
                                              batch_idx, False,
                                              instruction_lists,
-                                             executable_config_lists)
+                                             executable_config_lists, "recv")
 
         for invar, recv_uuid in zip(invars, recv_uuid_list):
             var_key = self.env.get_var_with_accumulate(invar, batch_idx)
@@ -676,7 +676,7 @@ class PipelineInstEmitter:
                     grad_vars, grad_sharding_specs, mesh_idx,
                     self.schedule.first_backward_batch_index,
                     global_config.use_memzero_for_gradient_accumulation,
-                    instruction_lists, executable_config_lists)
+                    instruction_lists, executable_config_lists, "grad acc")
 
         return grad_uuids, instruction_lists
 
@@ -917,7 +917,7 @@ class PipelineInstEmitter:
 
     def _compile_alloc(self, variables, sharding_specs, mesh_idx, batch_idx,
                        preallocated, instruction_lists,
-                       executable_config_lists):
+                       executable_config_lists, debug):
         """Compile an executable which allocates zero buffers.
 
         The zero buffers are:
@@ -946,14 +946,14 @@ class PipelineInstEmitter:
                 in_uuids = []
                 out_uuids = output_uuids
             instruction_lists[worker].append(
-                PipelineInstruction.run(
-                    config.exec_uuid,
-                    in_uuids,
-                    out_uuids, {
-                        "sync_before": False,
-                        "sync_after": False
-                    },
-                    info="mem set zero" if preallocated else "allocate zero"))
+                PipelineInstruction.run(config.exec_uuid,
+                                        in_uuids,
+                                        out_uuids, {
+                                            "sync_before": False,
+                                            "sync_after": False
+                                        },
+                                        info="mem set zero" if preallocated else
+                                        "allocate zero for " + debug))
 
         # shape: (#args, num_hosts, num_devices_per_host)
         for var_idx, var in enumerate(variables):
@@ -1151,9 +1151,11 @@ class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
         # This formulates what send task is required
         # Dict[int, Dict[int, Tuple(List, List)]]
         # src_mesh_idx -> (dst_mesh_idx -> (Vars, Sharding Specs))
-        self.stage_send_vars = [{} for _ in range(self.num_mesh)]
+        self.stage_send_vars = [{} for _ in range(len(self.stages))]
+        self._get_stage_send_vars()
 
     def _get_stage_send_vars(self):
+        self._compile_sharding_specs()
         var_defined = {}
         var_at_mesh = {}
         global_invar_set = set(self.global_invars)
@@ -1162,20 +1164,21 @@ class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
             assert len(self.schedule.stage_placement(stage_idx)) == 1
             mesh_idx = list(self.schedule.stage_placement(stage_idx))[0]
             for var_idx, var in enumerate(stage.invars):
-                if var in global_invar_set or mesh_idx in var_at_mesh[var]:
+                if (var in global_invar_set or var in self.grad_dummy_invars or
+                        mesh_idx in var_at_mesh[var]):
                     continue
                 else:
                     # Currently we use the first mesh, since there is almost no
                     # redundant computation and the first sends earlier. If the
                     # var is required multiple times, then we might need round-
                     # robin to avoid congestion.
-                    src_mesh_idx = list(var_defined[var])[0]
+                    src_stage_idx = list(var_defined[var])[0]
                     # once the var is received, it is permanent stored. Maybe
                     # we will can an option to config it.
                     var_at_mesh[var].add(mesh_idx)
                     # insert the recv task
                     var_and_specs = self.stage_send_vars[
-                        src_mesh_idx].setdefault(mesh_idx, ([], []))
+                        src_stage_idx].setdefault(mesh_idx, ([], []))
                     var_and_specs[0].append(var)
                     var_and_specs[1].append(stage.input_sharding_specs[var_idx])
 
