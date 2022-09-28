@@ -43,7 +43,7 @@ def send_tile(worker, uuid: int, device_id: int, offset: Sequence[slice],
                                       start_indices, slice_sizes)
         to_send = jax_tensor_to_xla_buffer(src_buffer)
         n_elements = np.prod(slice_sizes)
-        # dummy_compute_on_default_stream(device_id)
+        dummy_compute_on_default_stream(device_id)
 
         send_stream = col.get_stream(group_name, device_id, False)
         working_stream = xe.fetch_working_streams_from_pyclient(worker.backend)[device_id]

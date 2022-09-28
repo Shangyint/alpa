@@ -1005,8 +1005,6 @@ class CrossMeshCommunicator:
         if isinstance(node_mesh_mapping, pxla.ShardedAxis):
             tensor_dim, _ = chunk_axis_to_tensor_dim[node_mesh_mapping.axis]
             node_chunk = _get_chunk_value(sharding_spec.sharding[tensor_dim])
-        if node_chunk < mesh.num_hosts:
-            return sharding_spec
 
         sharding = list(sharding_spec.sharding)
         squeezed_mesh_mapping = [
