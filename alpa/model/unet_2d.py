@@ -497,19 +497,21 @@ class FlaxDownBlock2D(nn.Module):
     def __call__(self, hidden_states, temb, deterministic=True):
         output_states = ()
 
-        for resnet in self.resnets:
+        for idx, resnet in enumerate(self.resnets):
             hidden_states = resnet(hidden_states,
                                    temb,
                                    deterministic=deterministic)
             if self.config.add_manual_pipeline_markers:
-                mark_pipeline_boundary()
+                if idx != len(self.resnets) - 1:
+                    mark_pipeline_boundary()
             output_states += (hidden_states,)
 
         if self.add_downsample:
             hidden_states = self.downsamplers_0(hidden_states)
-            if self.config.add_manual_pipeline_markers:
-                mark_pipeline_boundary()
             output_states += (hidden_states,)
+        if self.config.add_manual_pipeline_markers:
+            # delaying the boundary here reduces the communciation memory
+            mark_pipeline_boundary()
 
         return hidden_states, output_states
 
@@ -893,8 +895,6 @@ class FlaxUNet2DConditionModel(nn.Module):
         sample = nn.silu(sample)
         sample = self.conv_out(sample)
         sample = jnp.transpose(sample, (0, 3, 1, 2))
-        if self.config.add_manual_pipeline_markers:
-            mark_pipeline_boundary()
 
         if not return_dict:
             return (sample,)
