@@ -127,9 +127,8 @@ def prepare_unet_input_and_model(benchmark_case):
 
     # Init train state
 
-    # TODO: replace the first term by CrossAtten*Block2D
-    down_block_types = ("DownBlock2D",) * (block_cnt - 1) + ("DownBlock2D",)
-    up_block_types = ("UpBlock2D",) * (block_cnt - 1) + ("UpBlock2D",)
+    down_block_types = ("CrossAttnDownBlock2D",) * (block_cnt - 1) + ("DownBlock2D",)
+    up_block_types = ("CrossAttnUpBlock2D",) * (block_cnt - 1) + ("UpBlock2D",)
     # Each downsampling, the num channels grows twice
     block_out_channels = [
         channel_size * (2**i) for i in range(block_cnt - 1)
@@ -198,12 +197,12 @@ def benchmark_unet_3d_internal(benchmark_case,
     #     for k in profiled:
     #         pstr += f"Exec {k}: {profiled[k][0]}s; "
     #     print(pstr)
+    executable.dump_debug_info("tmp")
 
     # Compute statistics
     num_gpus = virtual_mesh.num_devices
     tflops = executable.flop_count / num_gpus / np.mean(latencies) / 1e12
     parameter_count = compute_param_number(state.params)
-    print(tflops, parameter_count)
 
     (compute_cost_file_name, forward_stage_layer_ids, submesh_shapes,
      logical_mesh_shapes, autosharding_option_dicts) = get_last_dp_result()

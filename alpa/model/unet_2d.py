@@ -24,10 +24,11 @@ from jax.experimental.maps import FrozenDict
 import jax.numpy as jnp
 
 from alpa import mark_pipeline_boundary
-from alpa.model.bert_model import BertConfig, FlaxBertIntermediate, FlaxBertLayer, FlaxBertOutput
+from alpa.model.bert_model import BertConfig
 from alpa.model.model_util import ModelOutput
 
 
+# FIXME: not from bert config
 class UNet2DConfig(BertConfig):
 
     def __init__(self,
@@ -230,71 +231,53 @@ class FlaxResnetBlock2D(nn.Module):
         return hidden_states + residual
 
 
-##### Attentions
-# Do not add pipeline marker in this class
+##### Attentions - Do not add pipeline marker at this level
 class FlaxAttentionBlock(nn.Module):
     r"""
     A Flax multi-head attention module as described in: https://arxiv.org/abs/1706.03762
     Parameters:
         query_dim (:obj:`int`):
             Input hidden states dimension
-        config (:obj:`UNet2DConfig`):
-            UNet Global Config
+        heads (:obj:`int`, *optional*, defaults to 8):
+            Number of heads
+        dim_head (:obj:`int`, *optional*, defaults to 64):
+            Hidden states dimension inside each head
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
     query_dim: int
-    config: UNet2DConfig
+    heads: int = 8
+    dim_head: int = 64
+    dropout: float = 0.0
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        dim_head = self.config.hidden_size // self.config.num_attention_heads
-        self.scale = dim_head**-0.5
+        inner_dim = self.dim_head * self.heads
+        self.scale = self.dim_head**-0.5
 
         # Weights were exported with old names {to_q, to_k, to_v, to_out}
-        self.query = nn.Dense(self.config.hidden_size,
-                              use_bias=False,
-                              dtype=self.dtype,
-                              kernel_init=jax.nn.initializers.normal(
-                                  self.config.initializer_range),
-                              name="to_q")
-        self.key = nn.Dense(self.config.hidden_size,
-                            use_bias=False,
-                            dtype=self.dtype,
-                            kernel_init=jax.nn.initializers.normal(
-                                self.config.initializer_range),
-                            name="to_k")
-        self.value = nn.Dense(self.config.hidden_size,
-                              use_bias=False,
-                              dtype=self.dtype,
-                              kernel_init=jax.nn.initializers.normal(
-                                  self.config.initializer_range),
-                              name="to_v")
+        self.query = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, name="to_q")
+        self.key = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, name="to_k")
+        self.value = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype, name="to_v")
 
-        self.proj_attn = nn.Dense(self.query_dim,
-                                  dtype=self.dtype,
-                                  kernel_init=jax.nn.initializers.normal(
-                                      self.config.initializer_range),
-                                  name="to_out_0")
+        self.proj_attn = nn.Dense(self.query_dim, dtype=self.dtype, name="to_out_0")
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
-        head_size = self.config.hidden_size // self.config.num_attention_heads
-        tensor = tensor.reshape(batch_size, seq_len, head_size,
-                                dim // head_size)
+        head_size = self.heads
+        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
         tensor = jnp.transpose(tensor, (0, 2, 1, 3))
-        tensor = tensor.reshape(batch_size * head_size, seq_len,
-                                dim // head_size)
+        tensor = tensor.reshape(batch_size * head_size, seq_len, dim // head_size)
         return tensor
 
     def reshape_batch_dim_to_heads(self, tensor):
         batch_size, seq_len, dim = tensor.shape
-        head_size = self.config.hidden_size // self.config.num_attention_heads
-        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len,
-                                dim)
+        head_size = self.heads
+        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
         tensor = jnp.transpose(tensor, (0, 2, 1, 3))
-        tensor = tensor.reshape(batch_size // head_size, seq_len,
-                                dim * head_size)
+        tensor = tensor.reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
     def __call__(self, hidden_states, context=None, deterministic=True):
@@ -309,21 +292,17 @@ class FlaxAttentionBlock(nn.Module):
         value_states = self.reshape_heads_to_batch_dim(value_proj)
 
         # compute attentions
-        attention_scores = jnp.einsum("b i d, b j d->b i j", query_states,
-                                      key_states)
+        attention_scores = jnp.einsum("b i d, b j d->b i j", query_states, key_states)
         attention_scores = attention_scores * self.scale
         attention_probs = nn.softmax(attention_scores, axis=2)
 
         # attend to values
-        hidden_states = jnp.einsum("b i j, b j d -> b i d", attention_probs,
-                                   value_states)
+        hidden_states = jnp.einsum("b i j, b j d -> b i d", attention_probs, value_states)
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         hidden_states = self.proj_attn(hidden_states)
         return hidden_states
 
 
-# Do not add pipeline marker in this class: because very long residual
-# connection in SpatialTransformer block
 class FlaxBasicTransformerBlock(nn.Module):
     r"""
     A Flax transformer block layer with `GLU` (Gated Linear Unit) activation function as described in:
@@ -331,23 +310,27 @@ class FlaxBasicTransformerBlock(nn.Module):
     Parameters:
         dim (:obj:`int`):
             Inner hidden states dimension
-        config (:obj:`UNet2DConfig`):
-            UNet Global Config
+        n_heads (:obj:`int`):
+            Number of heads
+        d_head (:obj:`int`):
+            Hidden states dimension inside each head
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
     dim: int
-    config: UNet2DConfig
+    n_heads: int
+    d_head: int
+    dropout: float = 0.0
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         # self attention
-        self.attn1 = FlaxAttentionBlock(self.dim, self.config, dtype=self.dtype)
+        self.attn1 = FlaxAttentionBlock(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
         # cross attention
-        self.attn2 = FlaxAttentionBlock(self.dim, self.config, dtype=self.dtype)
-        self.intermediate = FlaxBertIntermediate(config=self.config,
-                                                 dtype=self.dtype)
-        self.output = FlaxBertOutput(config=self.config, dtype=self.dtype)
+        self.attn2 = FlaxAttentionBlock(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
+        self.ff = FlaxGluFeedForward(dim=self.dim, dropout=self.dropout, dtype=self.dtype)
         self.norm1 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
         self.norm2 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
         self.norm3 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
@@ -355,28 +338,22 @@ class FlaxBasicTransformerBlock(nn.Module):
     def __call__(self, hidden_states, context, deterministic=True):
         # self attention
         residual = hidden_states
-        hidden_states = self.attn1(self.norm1(hidden_states),
-                                   deterministic=deterministic)
+        hidden_states = self.attn1(self.norm1(hidden_states), deterministic=deterministic)
         hidden_states = hidden_states + residual
 
         # cross attention
         residual = hidden_states
-        hidden_states = self.attn2(self.norm2(hidden_states),
-                                   context,
-                                   deterministic=deterministic)
+        hidden_states = self.attn2(self.norm2(hidden_states), context, deterministic=deterministic)
         hidden_states = hidden_states + residual
 
         # feed forward
         residual = hidden_states
-        hidden_states = self.intermediate(self.norm3(hidden_states))
-        hidden_states = self.output(hidden_states,
-                                    residual,
-                                    deterministic=deterministic)
+        hidden_states = self.ff(self.norm3(hidden_states), deterministic=deterministic)
+        hidden_states = hidden_states + residual
 
         return hidden_states
 
 
-# Add pipeline marker in this class
 class FlaxSpatialTransformer(nn.Module):
     r"""
     A Spatial Transformer layer with Gated Linear Unit (GLU) activation function as described in:
@@ -384,23 +361,28 @@ class FlaxSpatialTransformer(nn.Module):
     Parameters:
         in_channels (:obj:`int`):
             Input number of channels
-        config (:obj:`UNet2DConfig`):
-            UNet Global Config
+        n_heads (:obj:`int`):
+            Number of heads
+        d_head (:obj:`int`):
+            Hidden states dimension inside each head
         depth (:obj:`int`, *optional*, defaults to 1):
             Number of transformers block
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
     in_channels: int
-    config: UNet2DConfig
+    n_heads: int
+    d_head: int
     depth: int = 1
+    dropout: float = 0.0
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.norm = nn.GroupNorm(num_groups=self.config.num_groups,
-                                 epsilon=1e-5)
+        self.norm = nn.GroupNorm(num_groups=32, epsilon=1e-5)
 
-        inner_dim = self.config.hidden_size
+        inner_dim = self.n_heads * self.d_head
         self.proj_in = nn.Conv(
             inner_dim,
             kernel_size=(1, 1),
@@ -409,15 +391,8 @@ class FlaxSpatialTransformer(nn.Module):
             dtype=self.dtype,
         )
 
-        # inner_dim->config.hidden_size
-        # self.n_heads->config.num_attention_heads
-        # self.d_head->can only be config.hidden_size // config.num_attention_heads
-        # according to the line aboves, this one doesn't matter
-        # self.dim * 4->config.intermediate_size
         self.transformer_blocks = [
-            FlaxBasicTransformerBlock(self.config.hidden_size,
-                                      self.config,
-                                      dtype=self.dtype)
+            FlaxBasicTransformerBlock(inner_dim, self.n_heads, self.d_head, dropout=self.dropout, dtype=self.dtype)
             for _ in range(self.depth)
         ]
 
@@ -438,21 +413,156 @@ class FlaxSpatialTransformer(nn.Module):
         hidden_states = hidden_states.reshape(batch, height * width, channels)
 
         for transformer_block in self.transformer_blocks:
-            hidden_states = transformer_block(hidden_states,
-                                              context,
-                                              deterministic=deterministic)
+            hidden_states = transformer_block(hidden_states, context, deterministic=deterministic)
 
         hidden_states = hidden_states.reshape(batch, height, width, channels)
 
         hidden_states = self.proj_out(hidden_states)
         hidden_states = hidden_states + residual
-        if self.config.add_manual_pipeline_markers:
-            mark_pipeline_boundary()
 
         return hidden_states
 
 
+class FlaxGluFeedForward(nn.Module):
+    r"""
+    Flax module that encapsulates two Linear layers separated by a gated linear unit activation from:
+    https://arxiv.org/abs/2002.05202
+    Parameters:
+        dim (:obj:`int`):
+            Inner hidden states dimension
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
+        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
+            Parameters `dtype`
+    """
+    dim: int
+    dropout: float = 0.0
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        # The second linear layer needs to be called
+        # net_2 for now to match the index of the Sequential layer
+        self.net_0 = FlaxGEGLU(self.dim, self.dropout, self.dtype)
+        self.net_2 = nn.Dense(self.dim, dtype=self.dtype)
+
+    def __call__(self, hidden_states, deterministic=True):
+        hidden_states = self.net_0(hidden_states)
+        hidden_states = self.net_2(hidden_states)
+        return hidden_states
+
+
+class FlaxGEGLU(nn.Module):
+    r"""
+    Flax implementation of a Linear layer followed by the variant of the gated linear unit activation function from
+    https://arxiv.org/abs/2002.05202.
+    Parameters:
+        dim (:obj:`int`):
+            Input hidden states dimension
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
+        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
+            Parameters `dtype`
+    """
+    dim: int
+    dropout: float = 0.0
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        inner_dim = self.dim * 4
+        self.proj = nn.Dense(inner_dim * 2, dtype=self.dtype)
+
+    def __call__(self, hidden_states, deterministic=True):
+        hidden_states = self.proj(hidden_states)
+        hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=2)
+        return hidden_linear * nn.gelu(hidden_gelu)
+
+
 ##### UNetBlocks - Add pipeline marker at this level
+class FlaxCrossAttnDownBlock2D(nn.Module):
+    r"""
+    Cross Attention 2D Downsizing block - original architecture from Unet transformers:
+    https://arxiv.org/abs/2103.06104
+    Parameters:
+        in_channels (:obj:`int`):
+            Input channels
+        out_channels (:obj:`int`):
+            Output channels
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
+        num_layers (:obj:`int`, *optional*, defaults to 1):
+            Number of attention blocks layers
+        attn_num_head_channels (:obj:`int`, *optional*, defaults to 1):
+            Number of attention heads of each spatial transformer block
+        add_downsample (:obj:`bool`, *optional*, defaults to `True`):
+            Whether to add downsampling layer before each final output
+        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
+            Parameters `dtype`
+    """
+    in_channels: int
+    out_channels: int
+    config: UNet2DConfig
+    add_downsample: bool = True
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        resnets = []
+        attentions = []
+
+        for i in range(self.config.layers_per_block):
+            in_channels = self.in_channels if i == 0 else self.out_channels
+
+            res_block = FlaxResnetBlock2D(
+                in_channels=in_channels,
+                config=self.config,
+                out_channels=self.out_channels,
+                dtype=self.dtype,
+            )
+            resnets.append(res_block)
+
+            attn_block = FlaxSpatialTransformer(
+                in_channels=self.out_channels,
+                n_heads=self.config.num_attention_heads,
+                d_head=self.out_channels // self.config.num_attention_heads,
+                depth=1,
+                dtype=self.dtype,
+            )
+            attentions.append(attn_block)
+
+        self.resnets = resnets
+        self.attentions = attentions
+
+        if self.add_downsample:
+            self.downsamplers_0 = FlaxDownsample2D(self.out_channels,
+                                                   dtype=self.dtype)
+
+    def __call__(self,
+                 hidden_states,
+                 temb,
+                 encoder_hidden_states,
+                 deterministic=True):
+        output_states = ()
+
+        for idx, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
+            hidden_states = resnet(hidden_states,
+                                   temb,
+                                   deterministic=deterministic)
+            hidden_states = attn(hidden_states,
+                                 encoder_hidden_states,
+                                 deterministic=deterministic)
+            if self.config.add_manual_pipeline_markers:
+                if idx != self.config.layers_per_block - 1:
+                    mark_pipeline_boundary()
+            output_states += (hidden_states,)
+
+        if self.add_downsample:
+            hidden_states = self.downsamplers_0(hidden_states)
+            output_states += (hidden_states,)
+        if self.config.add_manual_pipeline_markers:
+            mark_pipeline_boundary()
+
+        return hidden_states, output_states
+
+
 class FlaxDownBlock2D(nn.Module):
     r"""
     Flax 2D downsizing block
@@ -502,7 +612,7 @@ class FlaxDownBlock2D(nn.Module):
                                    temb,
                                    deterministic=deterministic)
             if self.config.add_manual_pipeline_markers:
-                if idx != len(self.resnets) - 1:
+                if idx != self.config.layers_per_block - 1:
                     mark_pipeline_boundary()
             output_states += (hidden_states,)
 
@@ -514,6 +624,94 @@ class FlaxDownBlock2D(nn.Module):
             mark_pipeline_boundary()
 
         return hidden_states, output_states
+
+
+class FlaxCrossAttnUpBlock2D(nn.Module):
+    r"""
+    Cross Attention 2D Upsampling block - original architecture from Unet transformers:
+    https://arxiv.org/abs/2103.06104
+    Parameters:
+        in_channels (:obj:`int`):
+            Input channels
+        out_channels (:obj:`int`):
+            Output channels
+        dropout (:obj:`float`, *optional*, defaults to 0.0):
+            Dropout rate
+        num_layers (:obj:`int`, *optional*, defaults to 1):
+            Number of attention blocks layers
+        attn_num_head_channels (:obj:`int`, *optional*, defaults to 1):
+            Number of attention heads of each spatial transformer block
+        add_upsample (:obj:`bool`, *optional*, defaults to `True`):
+            Whether to add upsampling layer before each final output
+        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
+            Parameters `dtype`
+    """
+    in_channels: int
+    out_channels: int
+    prev_output_channel: int
+    config: UNet2DConfig
+    add_upsample: bool = True
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        resnets = []
+        attentions = []
+
+        for i in range(self.config.layers_per_block):
+            res_skip_channels = self.in_channels if (
+                i == self.config.layers_per_block - 1) else self.out_channels
+            resnet_in_channels = self.prev_output_channel if i == 0 else self.out_channels
+
+            res_block = FlaxResnetBlock2D(
+                in_channels=resnet_in_channels + res_skip_channels,
+                config=self.config,
+                out_channels=self.out_channels,
+                dtype=self.dtype,
+            )
+            resnets.append(res_block)
+
+            attn_block = FlaxSpatialTransformer(
+                in_channels=self.out_channels,
+                n_heads=self.config.num_attention_heads,
+                d_head=self.out_channels // self.config.num_attention_heads,
+                depth=1,
+                dtype=self.dtype,
+            )
+            attentions.append(attn_block)
+
+        self.resnets = resnets
+        self.attentions = attentions
+
+        if self.add_upsample:
+            self.upsamplers_0 = FlaxUpsample2D(self.out_channels,
+                                               dtype=self.dtype)
+
+    def __call__(self,
+                 hidden_states,
+                 res_hidden_states_tuple,
+                 temb,
+                 encoder_hidden_states,
+                 deterministic=True):
+        for resnet, attn in zip(self.resnets, self.attentions):
+            # pop res hidden states
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = jnp.concatenate((hidden_states, res_hidden_states),
+                                            axis=-1)
+
+            hidden_states = resnet(hidden_states,
+                                   temb,
+                                   deterministic=deterministic)
+            hidden_states = attn(hidden_states,
+                                 encoder_hidden_states,
+                                 deterministic=deterministic)
+            if self.config.add_manual_pipeline_markers:
+                mark_pipeline_boundary()
+
+        if self.add_upsample:
+            hidden_states = self.upsamplers_0(hidden_states)
+
+        return hidden_states
 
 
 class FlaxUpBlock2D(nn.Module):
@@ -621,7 +819,8 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
         for _ in range(self.num_layers):
             attn_block = FlaxSpatialTransformer(
                 in_channels=self.in_channels,
-                config=self.config,
+                n_heads=self.config.num_attention_heads,
+                d_head=self.in_channels // self.config.num_attention_heads,
                 depth=1,
                 dtype=self.dtype,
             )
@@ -643,12 +842,13 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
                  temb,
                  encoder_hidden_states,
                  deterministic=True):
-        # (BS, SS // 2**(sampling-1), SS // 2**(sampling-1), block_out_channels[-1])
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             hidden_states = attn(hidden_states,
                                  encoder_hidden_states,
                                  deterministic=deterministic)
+            if self.config.add_manual_pipeline_markers:
+                mark_pipeline_boundary()
             hidden_states = resnet(hidden_states,
                                    temb,
                                    deterministic=deterministic)
@@ -743,16 +943,17 @@ class FlaxUNet2DConditionModel(nn.Module):
             output_channel = block_out_channels[i]
             is_final_block = i == len(block_out_channels) - 1
 
-            if down_block_type == "DownBlock2D":
-                down_block = FlaxDownBlock2D(
-                    in_channels=input_channel,
-                    out_channels=output_channel,
-                    config=self.config,
-                    add_downsample=not is_final_block,
-                    dtype=self.dtype,
-                )
+            if down_block_type == "CrossAttnDownBlock2D":
+                down_block_cls = FlaxCrossAttnDownBlock2D
             else:
-                raise NotImplementedError(f"{down_block_type} is not supported")
+                down_block_cls = FlaxDownBlock2D
+            down_block = down_block_cls(
+                in_channels=input_channel,
+                out_channels=output_channel,
+                config=self.config,
+                add_downsample=not is_final_block,
+                dtype=self.dtype,
+            )
 
             down_blocks.append(down_block)
         self.down_blocks = down_blocks
@@ -777,17 +978,18 @@ class FlaxUNet2DConditionModel(nn.Module):
 
             is_final_block = i == len(block_out_channels) - 1
 
-            if up_block_type == "UpBlock2D":
-                up_block = FlaxUpBlock2D(
-                    in_channels=input_channel,
-                    out_channels=output_channel,
-                    prev_output_channel=prev_output_channel,
-                    config=self.config,
-                    add_upsample=not is_final_block,
-                    dtype=self.dtype,
-                )
+            if up_block_type == "CrossAttnUpBlock2D":
+                up_block_cls = FlaxCrossAttnUpBlock2D
             else:
-                raise NotImplementedError(f"{up_block_type} is not supported")
+                up_block_cls = FlaxUpBlock2D
+            up_block = up_block_cls(
+                in_channels=input_channel,
+                out_channels=output_channel,
+                prev_output_channel=prev_output_channel,
+                config=self.config,
+                add_upsample=not is_final_block,
+                dtype=self.dtype,
+            )
 
             up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -835,7 +1037,6 @@ class FlaxUNet2DConditionModel(nn.Module):
             timesteps = jnp.expand_dims(timesteps, 0)
 
         t_emb = self.time_proj(timesteps)
-        # (1, time_embed_dim=block_out_channels[0] * 4)
         t_emb = self.time_embedding(t_emb)
 
         # 2. pre-process
@@ -849,25 +1050,23 @@ class FlaxUNet2DConditionModel(nn.Module):
         # 3. down
         down_block_res_samples = (sample,)
         for down_block in self.down_blocks:
-            if isinstance(down_block, FlaxDownBlock2D):
-                # input: (BS, SS // 2**i, SS // 2**i, block_out_channels[i])
+            if isinstance(down_block, FlaxCrossAttnDownBlock2D):
+                sample, res_samples = down_block(sample,
+                                                 t_emb,
+                                                 encoder_hidden_states,
+                                                 deterministic=not train)
+            else:
                 sample, res_samples = down_block(sample,
                                                  t_emb,
                                                  deterministic=not train)
-                # layer, then one more with
-                # (BS, SS // 2**(i+1), SS // 2**(i+1), block_out_channels[i])
-
-            else:
-                # sample, res_samples = down_block(sample, t_emb, encoder_hidden_states, deterministic=not train)
-                raise NotImplementedError()
 
             down_block_res_samples += res_samples
 
         # 4. mid
-        # sample = self.mid_block(sample,
-        #                         t_emb,
-        #                         encoder_hidden_states,
-        #                         deterministic=not train)
+        sample = self.mid_block(sample,
+                                t_emb,
+                                encoder_hidden_states,
+                                deterministic=not train)
 
         # 5. up
         for up_block in self.up_blocks:
@@ -875,20 +1074,19 @@ class FlaxUNet2DConditionModel(nn.Module):
                 self.config.layers_per_block + 1):]
             down_block_res_samples = down_block_res_samples[:-(
                 self.config.layers_per_block + 1)]
-            if isinstance(up_block, FlaxUpBlock2D):
+            if isinstance(up_block, FlaxCrossAttnUpBlock2D):
+                sample = up_block(
+                    sample,
+                    temb=t_emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    res_hidden_states_tuple=res_samples,
+                    deterministic=not train,
+                )
+            else:
                 sample = up_block(sample,
                                   temb=t_emb,
                                   res_hidden_states_tuple=res_samples,
                                   deterministic=not train)
-            else:
-                raise NotImplementedError()
-                # sample = up_block(
-                #     sample,
-                #     temb=t_emb,
-                #     encoder_hidden_states=encoder_hidden_states,
-                #     res_hidden_states_tuple=res_samples,
-                #     deterministic=not train,
-                # )
 
         # 6. post-process
         sample = self.conv_norm_out(sample)

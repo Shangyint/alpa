@@ -9,13 +9,14 @@ UNetModelConfig = namedtuple(
     "UNetModelConfig",
     ["image_size", "channel_size", "block_cnt", "dtype"])
 
+# block cnt->manual layers: {4: 13, }
 unet_specs = {
-    #
-    "a": UNetModelConfig(384, 20, 2, np.float32),
-    # "a": UNetModelConfig(384, 20, 4, np.float32),
-    "b": UNetModelConfig(384, 40, 4, np.float32),
-    "c": UNetModelConfig(384, 80, 4, np.float32),
-    "d": UNetModelConfig(384, 160, 4, np.float32),
+    # #Params: sample size, first channel's size, block cnt, dtype
+    "470M": UNetModelConfig(32, 320, 4, np.float32),
+    "1B": UNetModelConfig(32, 480, 4, np.float32),
+    "1.2B": UNetModelConfig(32, 512, 4, np.float32),
+    "1.8B": UNetModelConfig(32, 640, 4, np.float32),
+    "2B": UNetModelConfig(32, 672, 4, np.float32),
 }
 
 prefer_reduce_scatter = False
@@ -78,11 +79,18 @@ tmp_suite = {}
 perf_test_2d_suite = {}
 
 # Performance test with search solutions found for p3.16xlarge
-perf_test_auto_suite = {}
+perf_test_auto_suite = {
+    # 4: get_solution_case("1B", 1536, 24, [list(range(13))], [(1, 4)], [(1, 4)],
+    #                       [{}]),
+    4: get_solution_case("1B", 2048, 32, [list(range(8)), list(range(8, 13))], [(1, 2)] * 2, [(1, 2)] * 2,
+                          [{}] * 2),
+    8: get_solution_case("2B", 2048, 32, [list(range(8)), list(range(8, 13))], [(1, 4)] * 2, [(1, 4)] * 2,
+                          [{}] * 2),
+}
 
 # Grid search on hyperparameters
 # key = the number of gpus, value = a list of cases
 # model_name, B, NB
 grid_search_auto_suite = {
-    4: get_search_cases("a", 256, [16,])
+    4: get_search_cases("1B", 256, [16,])
 }
