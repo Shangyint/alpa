@@ -9,7 +9,7 @@ import optax
 import alpa
 from alpa import (parallelize, get_global_cluster,
                   set_global_virtual_physical_mesh, ShardParallel,
-                  automatic_remat)
+                  automatic_remat, global_config)
 from alpa.model.unet_2d import get_unet_2d
 from alpa.model.model_util import TrainState
 from alpa.pipeline_parallel.stage_construction import get_last_dp_result
@@ -164,10 +164,13 @@ def benchmark_unet_3d_internal(benchmark_case,
 
     # Parallel configs
     allow_mixed_mesh_shape = True
+    pipeline_schedule = ("1f1b_overlap_friendly"
+                         if global_config.enable_overlapping else "1f1b")
     (method, _, _, _) = get_pipeshard_parallel_method(
         benchmark_case,
         virtual_mesh.num_devices_per_host,
-        allow_mixed_mesh_shape=allow_mixed_mesh_shape)
+        allow_mixed_mesh_shape=allow_mixed_mesh_shape,
+        pipeline_schedule=pipeline_schedule)
     method: alpa.parallel_method.PipeshardParallel
     method.layer_option = ManualLayerOption(remat_layer=True)
 
