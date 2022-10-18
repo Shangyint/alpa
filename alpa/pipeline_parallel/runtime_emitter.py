@@ -135,12 +135,8 @@ MemZeroWorkerExecutableConfig = namedtuple(
 ConcatWorkerExecutableConfig = namedtuple("ConcatWorkerExecutableConfig",
                                           ["exec_uuid", "hlo"])
 PartialGradWorkerExecutableConfig = namedtuple(
-    "PartialGradWorkerExecutableConfig", [
-        "exec_uuid",
-        "hlo",
-        "stage_plan",
-        "donated_invars",
-    ])
+    "PartialGradWorkerExecutableConfig",
+    ["exec_uuid", "hlo", "stage_plan", "donated_invars", "kwargs"])
 
 ExecutableConfig = Union[AllocateZeroWorkerExecutableConfig,
                          MemZeroWorkerExecutableConfig,
@@ -508,14 +504,14 @@ class PipelineInstEmitter:
             self.flop_count)
 
     def _compile_get_vars_from_mesh(self, invars, dst_specs, mesh_idx,
-                                    batch_idx, instruction_lists,
+                                    batch_idx, comm_lists, alloc_lists,
                                     executable_config_lists):
         if len(invars) == 0:
             return
         # TODO(yonghao): only compile alloc once, use multiple times
         recv_uuid_list = self._compile_alloc(invars, dst_specs, mesh_idx,
                                              batch_idx, False,
-                                             instruction_lists,
+                                             alloc_lists,
                                              executable_config_lists, "recv")
 
         for invar, recv_uuid in zip(invars, recv_uuid_list):
@@ -530,11 +526,11 @@ class PipelineInstEmitter:
 
             if global_config.resharding_mode == "send_recv":
                 self._compile_resharding_task(src_uuid, resharding_task,
-                                              recv_uuid, instruction_lists)
+                                              recv_uuid, comm_lists)
             else:
                 self._compile_broadcast_resharding_task(
                     self.mesh_group[src_idx], src_uuid, resharding_task,
-                    recv_uuid, instruction_lists)
+                    recv_uuid, comm_lists)
 
     def _compile_exec_one_mesh(self, mesh_idx, task, executable_uuids,
                                donation_mapping, worker_tmp_instructions):
@@ -609,6 +605,7 @@ class PipelineInstEmitter:
             self._compile_get_vars_from_mesh(to_reshard_vars,
                                              reshard_sharding_specs, mesh_idx,
                                              batch_idx, instruction_lists,
+                                             instruction_lists,
                                              executable_config_lists)
 
             # execute
@@ -618,6 +615,9 @@ class PipelineInstEmitter:
 
         for worker, worker_instruction in worker_tmp_instructions.items():
             instruction_lists[worker].extend(worker_instruction)
+
+    def _compile_grad_get_executable_kwargs(self, stage_idx):
+        return {}
 
     def _compile_computation_executables(self):
         """Compile executables for forward, backward, and apply_grad
@@ -634,8 +634,9 @@ class PipelineInstEmitter:
             assert len(mesh_idx) == 1
             mesh_idx = list(mesh_idx)[0]
             hlo = stage.get_spmd_partitioned()
+            kwargs = self._compile_grad_get_executable_kwargs(stage_idx)
             exec_config = PartialGradWorkerExecutableConfig(
-                exec_uuid, hlo, stage.stage_plan, stage.donated_invars)
+                exec_uuid, hlo, stage.stage_plan, stage.donated_invars, kwargs)
 
             for worker in self.mesh_group[mesh_idx].workers:
                 executable_config_lists[worker].append(exec_config)
@@ -1146,15 +1147,17 @@ class PipelineInstEmitter:
 class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
 
     def __init__(self, *args, **kwargs):
+        outvar_def_order = kwargs.pop("outvar_def_order")
         super().__init__(*args, **kwargs)
         # Based on stage info, generate cross-mesh communication requirements
         # This formulates what send task is required
         # Dict[int, Dict[int, Tuple(List, List)]]
         # src_mesh_idx -> (dst_mesh_idx -> (Vars, Sharding Specs))
-        self.stage_send_vars = [{} for _ in range(len(self.stages))]
-        self._get_stage_send_vars()
+        self.stage_send_vars = [[] for _ in range(len(self.stages))]
+        self.send_var_sets = [{} for _ in range(len(self.stages))]
+        self._get_stage_send_vars(outvar_def_order)
 
-    def _get_stage_send_vars(self):
+    def _get_stage_send_vars(self, outvar_def_order):
         self._compile_sharding_specs()
         var_defined = {}
         var_at_mesh = {}
@@ -1177,23 +1180,69 @@ class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
                     # we will can an option to config it.
                     var_at_mesh[var].add(mesh_idx)
                     # insert the recv task
-                    var_and_specs = self.stage_send_vars[
-                        src_stage_idx].setdefault(mesh_idx, ([], []))
-                    var_and_specs[0].append(var)
-                    var_and_specs[1].append(stage.input_sharding_specs[var_idx])
+                    self.stage_send_vars[src_stage_idx].append(
+                        (mesh_idx, var, stage.input_sharding_specs[var_idx]))
 
             for var in stage.outvars:
                 var_defined.setdefault(var, OrderedSet()).add(stage_idx)
                 var_at_mesh.setdefault(var, OrderedSet()).add(mesh_idx)
+        # Reorder send and merge
+        for stage_idx, stage in enumerate(self.stages):
+            send_vars = self.stage_send_vars[stage_idx]
+            var_send_as = {v: (idx, spec) for (idx, v, spec) in send_vars}
+            final_send_seq = []
+            for v in outvar_def_order[stage_idx]:
+                if v in var_send_as:
+                    recv_stage_idx, spec = var_send_as[v]
+                    if len(final_send_seq) and (final_send_seq[-1][0]
+                                                == recv_stage_idx):
+                        final_send_seq[-1][1].append(v)
+                        final_send_seq[-1][2].append(spec)
+                    else:
+                        final_send_seq.append((recv_stage_idx, [v], [spec]))
+            self.stage_send_vars[stage_idx] = final_send_seq
+            self.send_var_sets[stage_idx] = set(var_send_as.keys())
+
+    def _compile_grad_get_executable_kwargs(self, stage_idx):
+        kwargs = super()._compile_grad_get_executable_kwargs(stage_idx)
+        if (stage_idx >= self.schedule.num_mesh and
+                global_config.enable_overlapping):
+            # Overlap the backward computation
+            # TODO: add more analysis to the comm size
+            comm_size = 0
+            indices = []
+            send_vars = self.send_var_sets[stage_idx]
+            last_send = None
+            size = 0
+            for idx, var in enumerate(self.stages[stage_idx].outvars):
+                if var in send_vars:
+                    indices.append(idx)
+                    if len([d for d in var.aval.shape if d > 1]) > 1:
+                        last_send = var.aval
+                        size += np.prod(last_send.shape) * last_send.dtype.itemsize
+            if last_send:
+                # size = np.prod(last_send.shape) * last_send.dtype.itemsize
+                comm_size = size / global_config.cross_mesh_bandwidth
+                comm_size *= global_config.device_tflops
+            # if len(indices):
+            #     print(comm_size, indices)
+            #     kwargs["overlap_dep_options"] = (comm_size, indices)
+        return kwargs
 
     def _compile_exec_one_tick(self, sched, donation_mapping, instruction_lists,
                                executable_uuids, executable_config_lists):
+        exec_insts = {}
+        comm_insts = {}
+        for mesh in self.mesh_group:
+            for worker in mesh.workers:
+                exec_insts[worker] = []
+                comm_insts[worker] = []
         for mesh_idx, task in enumerate(sched):
             if not task:
                 continue
             # execute
             self._compile_exec_one_mesh(mesh_idx, task, executable_uuids,
-                                        donation_mapping, instruction_lists)
+                                        donation_mapping, exec_insts)
         # send immediately after the result is created.
         # we use another iteration to launch exec before alloc zero for recv
         for mesh_idx, task in enumerate(sched):
@@ -1201,11 +1250,15 @@ class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
                 continue
             batch_idx, stage_idx = task
             if len(self.stage_send_vars[stage_idx]) > 0:
-                for receiver_idx in self.stage_send_vars[stage_idx]:
-                    (received_vars, received_sharding_specs
-                    ) = self.stage_send_vars[stage_idx][receiver_idx]
+                for recv_info in self.stage_send_vars[stage_idx]:
+                    (receiver_idx, received_vars,
+                     received_sharding_specs) = recv_info
                     self._compile_get_vars_from_mesh(received_vars,
                                                      received_sharding_specs,
                                                      receiver_idx, batch_idx,
+                                                     comm_insts,
                                                      instruction_lists,
                                                      executable_config_lists)
+        for worker in exec_insts:
+            instruction_lists[worker].extend(exec_insts[worker])
+            instruction_lists[worker].extend(comm_insts[worker])

@@ -259,9 +259,7 @@ def compile_pipeshard_executable_internal(
 
     # Wrap all things into a distributed runtime
     # TODO(yonghao): use virtual mesh instead of launched physical group
-    emitter_cls = (OverlapFriendlyPipelineInstEmitter if pipeline_schedule
-                   == "1f1b_overlap_friendly" else PipelineInstEmitter)
-    pipeshard_config = emitter_cls(
+    emitter_kwargs = dict(
         stages=xla_stages,
         global_invars=global_invars,
         grad_dummy_invars=grad_in_to_out,
@@ -274,7 +272,15 @@ def compile_pipeshard_executable_internal(
         default_auto_sharding_option=default_as_option,
         manual_stage_option=manual_stage_option,
         flop_count=total_flops,
-        allreduce_groups=allreduce_groups).compile()
+        allreduce_groups=allreduce_groups)
+    if pipeline_schedule == "1f1b_overlap_friendly":
+        emitter_cls = OverlapFriendlyPipelineInstEmitter
+        emitter_kwargs["outvar_def_order"] = [
+            stage.outvars_def_order() for stage in jax_all_stages
+        ]
+    else:
+        emitter_cls = PipelineInstEmitter
+    pipeshard_config = emitter_cls(**emitter_kwargs).compile()
 
     debug_compilation_time("runtime emitter")
     return pipeshard_config

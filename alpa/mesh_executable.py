@@ -435,12 +435,12 @@ class NormalMeshWorkerExecutable(MeshWorkerExecutable):
     """The worker part of a normal mesh executable."""
 
     def __init__(self, worker: "MeshHostWorker", uuid: int, hlo: WrappedHlo,
-                 stage_plan: StagePlan, donated_invars: Sequence[bool]):
+                 stage_plan: StagePlan, donated_invars: Sequence[bool], kwargs):
         num_devices = np.prod(stage_plan.logical_mesh_shape)
         assert num_devices == len(worker.backend.devices())
 
         self.compiled = run_backend_compilation(worker.backend, hlo, stage_plan,
-                                                num_devices)
+                                                num_devices, **kwargs)
         self.donated_invars = donated_invars
         self.worker = worker
 
@@ -1007,8 +1007,9 @@ class PartialGradAccMeshWorkerExecutable(NormalMeshWorkerExecutable):
     """
 
     def __init__(self, worker: "MeshHostWorker", uuid: int, hlo: WrappedHlo,
-                 stage_plan: StagePlan, donated_invars: Sequence[bool]):
-        super().__init__(worker, uuid, hlo, stage_plan, donated_invars)
+                 stage_plan: StagePlan, donated_invars: Sequence[bool],
+                 kwargs):
+        super().__init__(worker, uuid, hlo, stage_plan, donated_invars, kwargs)
         self.grad_sync_channel_ids = get_grad_sync_channel_ids(
             self.compiled.hlo_modules()[0])
         self.skip_allreduce_env_name = (self.compiled.hlo_modules()[0].name +
