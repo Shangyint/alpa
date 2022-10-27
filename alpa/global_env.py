@@ -61,7 +61,7 @@ class GlobalConfig:
         self.use_memzero_for_gradient_accumulation = False
         # Cross mesh resharding mode. Possible choices: {"send_recv",
         # "broadcast"}
-        self.resharding_mode = "send_recv"
+        self.resharding_mode = "broadcast"
         # Which nccl to use. Possible choices: {"cupy",
         # "xla_extension"}
         self.nccl_mode = "xla_extension"

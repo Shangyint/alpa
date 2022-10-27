@@ -515,7 +515,6 @@ def layer_level_jaxpr_transformation(fn: Callable,
                                                    cost_criteria=cost_criteria)
         else:
             sliced_eqns = slice_eqns_by_layer_boundary(jaxpr)
-        log_layer_slicing_stats(jaxpr, sliced_eqns)
 
         if global_config.print_auto_layer_stats:
             log_layer_slicing_stats(jaxpr, sliced_eqns)

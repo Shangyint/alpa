@@ -1224,9 +1224,9 @@ class OverlapFriendlyPipelineInstEmitter(PipelineInstEmitter):
                 # size = np.prod(last_send.shape) * last_send.dtype.itemsize
                 comm_size = size / global_config.cross_mesh_bandwidth
                 comm_size *= global_config.device_tflops
-            # if len(indices):
-            #     print(comm_size, indices)
-            #     kwargs["overlap_dep_options"] = (comm_size, indices)
+            if len(indices):
+                print(comm_size, indices)
+                kwargs["overlap_dep_options"] = (comm_size, indices)
         return kwargs
 
     def _compile_exec_one_tick(self, sched, donation_mapping, instruction_lists,
