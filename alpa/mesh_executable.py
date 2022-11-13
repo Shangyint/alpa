@@ -140,13 +140,6 @@ class MeshWorkerExecutable(ABC):
         """Get the total memory allocation size in bytes."""
         raise NotImplementedError()
 
-    # @staticmethod
-    # def synchronize_inputs_done_events(inputs_done_events, all_working_streams):
-    #     for events in inputs_done_events:
-    #         for working_streams in all_working_streams:
-    #             for event, stream in zip(events, working_streams):
-    #                 util.synchronize_event(event, stream)
-
 
 # The global executable counter
 mesh_executable_counter = 0
@@ -1209,6 +1202,7 @@ class UtilMeshWorkerExecutable(MeshWorkerExecutable):
                           sync_after: bool):
         """Run the executable on the worker."""
         buffer_dict = self.worker.buffers
+
         # Get input
         input_bufs = [buffer_dict[x] for x in input_uuids]
 

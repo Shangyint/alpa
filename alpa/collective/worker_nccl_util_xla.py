@@ -13,7 +13,7 @@ from alpa.util import (jax_tensor_set, jax_tensor_index,
                        xla_buffer_to_jax_tensor, jax_tensor_to_xla_buffer,
                        is_continuous_subset, infer_offset_and_n_elements,
                        infer_start_pos_and_n_elements, mark_event, synchronize_one_event)
-from alpa.pipeline_parallel.xla_custom_call_marker import dummy_compute_on_default_stream
+# from alpa.pipeline_parallel.xla_custom_call_marker import dummy_compute_on_default_stream
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -43,7 +43,7 @@ def send_tile(worker, uuid: int, device_id: int, offset: Sequence[slice],
                                       start_indices, slice_sizes)
         to_send = jax_tensor_to_xla_buffer(src_buffer)
         n_elements = np.prod(slice_sizes)
-        dummy_compute_on_default_stream(device_id)
+        # dummy_compute_on_default_stream(device_id)
 
         send_stream = col.get_stream(group_name, device_id, False)
         working_stream = xe.fetch_working_streams_from_pyclient(worker.backend)[device_id]

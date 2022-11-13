@@ -103,7 +103,6 @@ class PipeshardDriverExecutable:
                 task.create_resharding_communicators()
 
         self.instruction_lists = pipeshard_config.instruction_lists
-        # self.optimize_instructions_order()
         
         self.exec_uuid = next_mesh_executable_uuid()
         # Create a PipeshardMeshWorkerExecuable for each MeshHostWorker
@@ -123,21 +122,6 @@ class PipeshardDriverExecutable:
                 worker.put_executable.remote(self.exec_uuid,
                                              PipeshardMeshWorkerExecuable,
                                              *args)
-
-    def profile_instructions(self):
-        """
-            return a dictionary in which the key is worker, 
-            the value is the time cost for each instruction for this worker. 
-        """
-        self.instruction_costs = {}
-        for worker, insts in self.instruction_lists.items():
-            self.instruction_costs[worker] = []
-        pass 
-        # TODO(hexu): finish this
-
-    def optimize_instructions_order(self):
-        
-        pass
 
     ##### Compilation Related Functions #####
     def _instantiate_nccl_groups(self, device_str_groups):
@@ -565,7 +549,6 @@ class PipeshardMeshWorkerExecuable:
 
             if instruction.opcode == PipelineInstType.RUN:
                 log_run_begin(instruction.info, sync_func=sync_func)
-
                 self.worker.run_executable(instruction.task_uuid,
                                            instruction.input_uuids,
                                            instruction.output_uuids,

@@ -1,12 +1,9 @@
 """NCCL-based collective operations."""
 import logging
-import os
 
 import ray
 import cupy
 from jaxlib import xla_extension
-
-from jax._src.lib import xla_bridge as xb, xla_extension as xe
 
 from alpa.collective.const import ENV
 from alpa.collective.collective_group import nccl_util
@@ -17,8 +14,6 @@ from alpa.collective.types import (AllReduceOptions, BarrierOptions, Backend,
                                    AllGatherOptions, ReduceScatterOptions,
                                    SendOptions, RecvOptions)
 from alpa.collective.collective_group.cuda_stream import get_stream_pool
-from alpa.global_env import global_config
-from alpa.monkey_patch import override_get_backend
 
 logger = logging.getLogger(__name__)
 
@@ -43,39 +38,10 @@ class NCCLGroup(BaseGroup):
         # TODO(Fu): might need an event map
         self._dev_event_map = {}
 
-        self.input_xla_cuda_streams = {}
-        self.output_xla_cuda_streams = {}
-        self.input_cupy_cuda_streams = {}
-        self.output_cupy_cuda_streams = {}
-
-        backend = override_get_backend()
-        # print(backend)
-        self.initialize_streams(backend)
-
         if nccl_util.get_nccl_build_version() < 2000:
             raise RuntimeError("NCCL in Ray requires NCCL >= 2.0.")
         if nccl_util.get_nccl_runtime_version() < 2704:
             logger.warning("NCCL send/recv calls requires NCCL>=2.7.4")
-
-    def initialize_streams(self, backend):
-        for gpu_idx in range(backend.local_device_count()):
-            # print(gpu_idx)
-            
-            self.input_xla_cuda_streams[gpu_idx] = xe.create_xla_cuda_stream(backend, gpu_idx)
-            self.output_xla_cuda_streams[gpu_idx] = xe.create_xla_cuda_stream(backend, gpu_idx)
-            in_stream_ptr = xe.get_cuda_stream(self.input_xla_cuda_streams[gpu_idx])
-            out_stream_ptr = xe.get_cuda_stream(self.output_xla_cuda_streams[gpu_idx])
-            self.input_cupy_cuda_streams[gpu_idx] = cupy.cuda.ExternalStream(in_stream_ptr, gpu_idx)
-            self.output_cupy_cuda_streams[gpu_idx] = cupy.cuda.ExternalStream(out_stream_ptr, gpu_idx)
-
-        # print("input_xla_cuda_streams: ", self.input_xla_cuda_streams)
-        # for gpu_idx in range(backend.local_device_count()):
-        #     xe.check_liveness(self.input_xla_cuda_streams[gpu_idx])
-        #     print("cupy ptr: ", self.input_cupy_cuda_streams[gpu_idx].ptr)
-        # print("output_xla_cuda_streams: ", self.output_xla_cuda_streams)
-        # for gpu_idx in range(backend.local_device_count()):
-        #     xe.check_liveness(self.output_xla_cuda_streams[gpu_idx])
-        #     print("cupy ptr: ", self.output_cupy_cuda_streams[gpu_idx].ptr)
 
     def destroy_group(self):
         """Destroy the group and release NCCL communicators."""
@@ -276,13 +242,7 @@ class NCCLGroup(BaseGroup):
             with nccl_util.Device(device_id):
                 comms[i] = nccl_util.create_nccl_communicator(
                     world_size, nccl_uid, global_rank)
-                if global_config.enable_overlapping:
-                    # streams[i] = (self.output_cupy_cuda_streams[device_id]
-                    #               if global_rank == 0 else
-                    #               self.input_cupy_cuda_streams[device_id])
-                    pass #TODO(hexu)
-                else:
-                    streams[i] = get_stream_pool(device_id).get_stream()
+                streams[i] = get_stream_pool(device_id).get_stream()
                 events[i] = cupy.cuda.Event()
         nccl_util.groupEnd()
         self._dev_comm_map[comm_key] = comms
@@ -408,17 +368,11 @@ class NCCLGroup(BaseGroup):
         """
 
         def p2p_fn(tensor, comm, stream, peer):
-            if global_config.enable_overlapping:
-                stream_ptr = stream[0].ptr
-                # stream_ptr = 1
-            else:
-                stream_ptr = stream.ptr
-            
             comm.send(
                 nccl_util.get_tensor_ptr(tensor),
                 send_options.n_elements if send_options.n_elements > 0 else
                 nccl_util.get_tensor_n_elements(tensor),
-                nccl_util.get_nccl_tensor_dtype(tensor), peer, stream_ptr)
+                nccl_util.get_nccl_tensor_dtype(tensor), peer, stream.ptr)
 
         self._point2point(tensors, p2p_fn, send_options.dst_rank,
                           send_options.dst_gpu_index)
@@ -435,17 +389,11 @@ class NCCLGroup(BaseGroup):
         """
 
         def p2p_fn(tensor, comm, stream, peer):
-            if global_config.enable_overlapping:
-                stream_ptr = stream[1].ptr
-                # stream_ptr = 1
-            else:
-                stream_ptr = stream.ptr
-
             comm.recv(
                 nccl_util.get_tensor_ptr(tensor),
                 recv_options.n_elements if recv_options.n_elements > 0 else
                 nccl_util.get_tensor_n_elements(tensor),
-                nccl_util.get_nccl_tensor_dtype(tensor), peer, stream_ptr)
+                nccl_util.get_nccl_tensor_dtype(tensor), peer, stream.ptr)
 
         self._point2point(tensors, p2p_fn, recv_options.src_rank,
                           recv_options.src_gpu_index)
@@ -608,12 +556,7 @@ class NCCLGroup(BaseGroup):
         # create the p2p communicators
         with nccl_util.Device(my_gpu_idx):
             comm = nccl_util.create_nccl_communicator(2, nccl_uid, my_p2p_rank)
-            if global_config.enable_overlapping:
-                stream = [self.output_cupy_cuda_streams[my_gpu_idx], self.input_cupy_cuda_streams[my_gpu_idx]]
-                #(self.output_cupy_cuda_streams[my_gpu_idx]
-                        #   if is_sender else self.input_cupy_cuda_streams[my_gpu_idx])
-            else:
-                stream = get_stream_pool(my_gpu_idx).get_stream()
+            stream = get_stream_pool(my_gpu_idx).get_stream()
             event = cupy.cuda.Event()
 
         self._dev_comm_map[comm_key] = [comm]
