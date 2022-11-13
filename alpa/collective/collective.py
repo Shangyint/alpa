@@ -126,16 +126,8 @@ class GroupManager:
         except ValueError:
             pass
 
-    def initialize_streams_for_groups(self, backend):
-        for name, group in self._name_group_map.items():
-            print(name)
-            group.initialize_streams(backend)
-
 
 _group_mgr = GroupManager()
-
-def initialize_streams_for_groups(backend):
-    _group_mgr.initialize_streams_for_groups(backend)
 
 def is_group_initialized(group_name):
     """Check if the group is initialized in this process by the group name."""

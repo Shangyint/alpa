@@ -129,6 +129,66 @@ class XLANCCLGroup(BaseGroup):
         self._dev_comm_map[comm_key] = comms
         return comms
 
+    def _get_nccl_collective_communicator(self,
+                                          comm_key,
+                                          device_list):
+        """Create or retrieve an NCCL communicator from cache.
+
+        If the communicator is found in cache, return the communicator. If not,
+        a communicator and a stream will be created and put in cache.
+        TODO(Hao): this function is not thread-safe now.
+
+        Args:
+            comm_key (str): the key to query the communicator cache.
+            device_list (List): a list of GPU devices of the current process
+                                that participates into the collective.
+
+        Returns:
+            communicator: the NCCL communicator corresponded to the devices.
+        """
+        if not comm_key:
+            raise RuntimeError("Got empty communicator key.")
+        for d in device_list:
+            self._used_gpu_indices.add(d)
+
+        # TODO(Hao): lock the _dev_comm_map here.
+        if comm_key in self._dev_comm_map:
+            return self._dev_comm_map[comm_key]
+
+        group_key = self._generate_group_key(comm_key)
+        if self.rank == 0:
+            nccl_uid = self._generate_nccl_uid(group_key)
+        else:
+            rendezvous = Rendezvous(group_key)
+            rendezvous.meet()
+            nccl_uid = rendezvous.get_nccl_id()
+
+            # Recycle the NCCLUniqueIDStore named actor *pro-activately* to
+            # avoid named actor leak.
+            if rendezvous.get_access_counter() == self.world_size:
+                logger.debug(
+                    "NCCLUniqueID has been broadcasted. The NCCLUniqueIDStore "
+                    "will go out of context and be destroyed.")
+                rendezvous.destroy_store()
+
+        # Now create the communicators
+        actual_world_size = len(device_list) * self.world_size
+
+        # FIXME: pass the start rank at the initial point
+        start_rank = self.rank * len(device_list)
+        actual_ranks = [start_rank + i for i in range(len(device_list))]
+        local_ids = list(range(len(device_list)))
+        comms = xe.nccl_create_communicators(
+            actual_world_size, actual_ranks, local_ids, nccl_uid)
+
+        self._dev_comm_map[comm_key] = comms
+        return comms
+
+    def get_nccl_collective_communicator(self, devices, lib):
+        key = _get_comm_key_from_devices(devices)
+        assert lib == "xla"
+        return self._get_nccl_collective_communicator(key, devices)
+
     def _get_nccl_p2p_communicator(self,
                                    comm_key,
                                    my_gpu_idx,
@@ -380,6 +440,21 @@ class XLANCCLGroup(BaseGroup):
     def backend(cls):
         return Backend.NCCL
 
+
+def _get_comm_key_from_devices(devices):
+    """Return a key from a list of devices for collective calls.
+
+    For example, if the tensors are on gpus 0, 1, 2, 3,
+    then the key would be "0,1,2,3".
+
+    Args:
+        devices(list): a list of GPU device indices
+
+    Returns:
+        str: a string represents the key to query the communicator cache.
+
+    """
+    return ",".join([str(d) for d in devices])
 
 def _get_comm_key_send_recv(my_rank, my_gpu_idx, peer_rank, peer_gpu_idx):
     """Return a key given source and destination ranks for p2p tasks.

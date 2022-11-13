@@ -136,7 +136,6 @@ class MeshHostWorker:
                 f"backend {global_config.backend} is not supported")
         # Monkey patch the backend
         set_override_backend(self.backend)
-        # self.initialize_streams_for_groups(self.backend)
         self.local_devices = self.backend.local_devices()
         self.num_devices = len(self.local_devices)
 
@@ -163,9 +162,6 @@ class MeshHostWorker:
                     worker_nccl_util.to_signal_buffer(jax_tensor))
 
         self.launched = True
-
-    def initialize_streams_for_groups(self, backend):
-        col.initialize_streams_for_groups(backend)
 
     ##### Buffer Related Functions #####
     def put_buffers(self,
