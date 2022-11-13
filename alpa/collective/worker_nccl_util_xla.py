@@ -107,6 +107,8 @@ def recv_tile(worker, uuid: int, device_id: int,
 
 def allgather(worker, uuid: int, device_ids: Sequence[int],
               tensor_slices: Sequence[slice], output_slice):
+    # FIXME: handle the case that local device ids are the same but global ids
+    # are different
     communicators = worker.allgather_communicators[repr(sorted(device_ids))]
     tensor_shape = worker.buffers[uuid][device_ids[0]].shape
     global_start_pos, _ = infer_start_pos_and_n_elements(
@@ -190,10 +192,6 @@ def broadcast(worker, uuid, comm_key, world_size, devices_ids,
                                         start_indices)
             new_buffer = jax_tensor_to_xla_buffer(new_buffer)
         worker.buffers[uuid][device_id] = new_buffer
-
-
-def init_local_comm(device_ids):
-    return xe.nccl_init_communicator(device_ids, ENV.NCCL_USE_MULTISTREAM.val)
 
 
 to_signal_buffer = jax_tensor_to_xla_buffer

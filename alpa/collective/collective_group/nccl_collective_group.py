@@ -452,7 +452,7 @@ class NCCLGroup(BaseGroup):
             start_rank = self.rank * len(device_list)
             actual_ranks = [start_rank + i for i in range(len(device_list))]
             local_ids = list(range(len(device_list)))
-            comms = xla_extension.nccl_create_communicators_no_stream(
+            comms = xla_extension.nccl_create_communicators(
                 actual_world_size, actual_ranks, local_ids, nccl_uid)
         nccl_util.groupStart()
         for i, device in enumerate(device_list):

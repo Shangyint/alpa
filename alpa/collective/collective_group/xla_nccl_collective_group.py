@@ -28,8 +28,8 @@ class XLANCCLGroup(BaseGroup):
         # communicator and stream cache.
         # TODO (Hao): we need a lock here...
         self._barrier_tensor = None
+        self.use_default_stream = not global_config.enable_overlapping
         self._dev_comm_map = {}
-        self._dev_streams_map = {}
 
         # record the used GPU IDs.
         self._used_gpu_indices = set()
@@ -48,17 +48,16 @@ class XLANCCLGroup(BaseGroup):
             logger.warning("NCCL send/recv calls requires NCCL>=2.7.4")
 
     def initialize_streams(self, backend):
-        for gpu_idx in range(backend.local_device_count()):
-            self.input_xla_cuda_streams[gpu_idx] = xe.create_xla_cuda_stream(backend, gpu_idx)
-            self.output_xla_cuda_streams[gpu_idx] = xe.create_xla_cuda_stream(backend, gpu_idx)
+        if not self.use_default_stream:
+            xe.nccl_create_streams(backend, range(backend.local_device_count()))
 
     def destroy_group(self):
         """Destroy the group and release NCCL communicators."""
-        if len(self._dev_comm_map.keys()) > 0:
+        if len(self._dev_comm_map) > 0:
 
             # Destroy the communicators and streams.
-            for comm_key, comms in self._dev_comm_map.items():
-                xe.nccl_destroy_comms(comms)
+            for comm_key in self._dev_comm_map:
+                xe.nccl_destroy_comms(comm_key)
                 self._dev_comm_map[comm_key] = None
 
         if self.rank == 0:
@@ -68,37 +67,8 @@ class XLANCCLGroup(BaseGroup):
                 self._destroy_store(group_key)
         self._barrier_tensor = None
         self._dev_comm_map = None
-        self._dev_streams_map = None
 
-    @classmethod
-    def backend(cls):
-        return Backend.NCCL
-
-    def broadcast_partialgpu(self,
-                             tensors,
-                             broadcast_options=BroadcastOptions()):
-        """Broadcast tensors to all other gpus following options.
-        It will only involve subset of gpu in this worker.
-
-        Args:
-            tensors (List): tensors to be broadcast or received.
-            broadcast_options: broadcast options.
-
-        Returns:
-            None
-        """
-        root_rank = 0
-
-        key = broadcast_options.comm_key
-        comms = self._get_nccl_broadcast_communicator(
-            key, broadcast_options.world_size, broadcast_options.devices_ids,
-            broadcast_options.devices_global_rank)
-        is_receiver = broadcast_options.devices_global_rank[0] != 0
-        xe.nccl_broadcast_partial_gpus(comms, tensors,
-                                       broadcast_options.local_start_pos_list,
-                                       broadcast_options.n_elements, root_rank,
-                                       is_receiver)
-
+    # functions to get communicator:
     def _get_nccl_broadcast_communicator(self,
                                          comm_key,
                                          world_size,
@@ -154,63 +124,10 @@ class XLANCCLGroup(BaseGroup):
                         "destroyed.")
                     rendezvous.destroy_store()
 
-        streams = [[self.output_xla_cuda_streams[gpu_idx],
-                    self.input_xla_cuda_streams[gpu_idx]]
-                   for gpu_idx in devices_ids]
         comms = xe.nccl_create_communicators(world_size, devices_global_rank,
-                                             devices_ids, nccl_uid,
-                                             global_config.enable_overlapping,
-                                             streams)
+                                             devices_ids, nccl_uid)
         self._dev_comm_map[comm_key] = comms
         return comms
-
-    def send(self, tensors, send_options=SendOptions()):
-        """Send a tensor to a destination gpu in the group.
-
-        Args:
-            tensors (List): the tensor to send.
-            send_options: send options.
-
-        Returns:
-            None
-        """
-
-        buffer = tensors[0]
-        my_gpu_idx = xe.get_buffer_device_id(buffer)
-        peer_rank, peer_gpu_idx = \
-            send_options.dst_rank, send_options.dst_gpu_index
-        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
-                                           peer_gpu_idx)
-        comms = self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                                peer_gpu_idx)
-
-        peer_p2p_rank = 0 if self.rank > peer_rank else 1
-        xe.nccl_send(comms, buffer, send_options.start_pos,
-                     send_options.n_elements, peer_p2p_rank)
-
-    def recv(self, tensors, recv_options=RecvOptions()):
-        """Receive a tensor from a source gpu in the group.
-
-        Args:
-            tensors (List): the received tensor.
-            recv_options: Receive options.
-
-        Returns:
-            None
-        """
-
-        buffer = tensors[0]
-        my_gpu_idx = xe.get_buffer_device_id(buffer)
-        peer_rank, peer_gpu_idx = \
-            recv_options.src_rank, recv_options.src_gpu_index
-        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
-                                           peer_gpu_idx)
-        comms = self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                                peer_gpu_idx)
-
-        peer_p2p_rank = 0 if self.rank > peer_rank else 1
-        xe.nccl_recv(comms, buffer, recv_options.start_pos,
-                     recv_options.n_elements, peer_p2p_rank)
 
     def _get_nccl_p2p_communicator(self,
                                    comm_key,
@@ -277,13 +194,109 @@ class XLANCCLGroup(BaseGroup):
                     rendezvous.destroy_store()
 
         comms = xe.nccl_create_communicators(2, [my_p2p_rank], [my_gpu_idx],
-                                             nccl_uid,
-                                             global_config.enable_overlapping,
-                                             [[self.output_xla_cuda_streams[my_gpu_idx],
-                                               self.input_xla_cuda_streams[my_gpu_idx]]])
+                                             nccl_uid)
         self._dev_comm_map[comm_key] = comms
         return comms
 
+    def create_p2p_communicator(self,
+                                my_gpu_idx: int,
+                                peer_rank: int,
+                                peer_gpu_idx: int,
+                                nccl_uid: str = None):
+        """A public method to create p2p communicators
+
+        Args:
+            my_gpu_idx (int): the gpu index on self rank.
+            peer_rank (int): the rank of the peer process.
+            peer_gpu_idx (int): the index of the gpu on the peer process.
+            nccl_uid (str, optional): optionally to provide the NCCLUniqueID in
+                advance.
+
+        Returns:
+            None
+        """
+        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
+                                           peer_gpu_idx)
+        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+                                        peer_gpu_idx, nccl_uid)
+
+    # communicate operations
+    def broadcast_partialgpu(self,
+                             tensors,
+                             broadcast_options=BroadcastOptions()):
+        """Broadcast tensors to all other gpus following options.
+        It will only involve subset of gpu in this worker.
+
+        Args:
+            tensors (List): tensors to be broadcast or received.
+            broadcast_options: broadcast options.
+
+        Returns:
+            None
+        """
+        root_rank = 0
+
+        key = broadcast_options.comm_key
+        self._get_nccl_broadcast_communicator(
+            key, broadcast_options.world_size, broadcast_options.devices_ids,
+            broadcast_options.devices_global_rank)
+        is_receiver = broadcast_options.devices_global_rank[0] != 0
+        xe.nccl_broadcast_partial_gpus(key, tensors,
+                                       broadcast_options.local_start_pos_list,
+                                       broadcast_options.n_elements, root_rank,
+                                       is_receiver, self.use_default_stream)
+
+    def send(self, tensors, send_options=SendOptions()):
+        """Send a tensor to a destination gpu in the group.
+
+        Args:
+            tensors (List): the tensor to send.
+            send_options: send options.
+
+        Returns:
+            None
+        """
+
+        buffer = tensors[0]
+        my_gpu_idx = xe.get_buffer_device_id(buffer)
+        peer_rank, peer_gpu_idx = \
+            send_options.dst_rank, send_options.dst_gpu_index
+        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
+                                           peer_gpu_idx)
+        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+                                        peer_gpu_idx)
+
+        peer_p2p_rank = 0 if self.rank > peer_rank else 1
+        xe.nccl_send(comm_key, buffer, send_options.start_pos,
+                     send_options.n_elements, peer_p2p_rank,
+                     self.use_default_stream)
+
+    def recv(self, tensors, recv_options=RecvOptions()):
+        """Receive a tensor from a source gpu in the group.
+
+        Args:
+            tensors (List): the received tensor.
+            recv_options: Receive options.
+
+        Returns:
+            None
+        """
+
+        buffer = tensors[0]
+        my_gpu_idx = xe.get_buffer_device_id(buffer)
+        peer_rank, peer_gpu_idx = \
+            recv_options.src_rank, recv_options.src_gpu_index
+        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
+                                           peer_gpu_idx)
+        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+                                        peer_gpu_idx)
+
+        peer_p2p_rank = 0 if self.rank > peer_rank else 1
+        xe.nccl_recv(comm_key, buffer, recv_options.start_pos,
+                     recv_options.n_elements, peer_p2p_rank,
+                     self.use_default_stream)
+
+    # helper functions to build communicatiors
     def _generate_group_key(self, comm_key):
         """Generate a unique key used to initialize the KV store.
 
@@ -338,28 +351,7 @@ class XLANCCLGroup(BaseGroup):
         ray.get([store.set_id.remote(group_uid)])
         return group_uid
 
-    def create_p2p_communicator(self,
-                                my_gpu_idx: int,
-                                peer_rank: int,
-                                peer_gpu_idx: int,
-                                nccl_uid: str = None):
-        """A public method to create p2p communicators
-
-        Args:
-            my_gpu_idx (int): the gpu index on self rank.
-            peer_rank (int): the rank of the peer process.
-            peer_gpu_idx (int): the index of the gpu on the peer process.
-            nccl_uid (str, optional): optionally to provide the NCCLUniqueID in
-                advance.
-
-        Returns:
-            None
-        """
-        comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
-                                           peer_gpu_idx)
-        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                        peer_gpu_idx, nccl_uid)
-
+    # unimplemented
     def allreduce(self, tensors, allreduce_options=AllReduceOptions()):
         raise NotImplementedError()
 
@@ -383,6 +375,10 @@ class XLANCCLGroup(BaseGroup):
                       tensor_lists,
                       reducescatter_options=ReduceScatterOptions()):
         raise NotImplementedError()
+
+    @classmethod
+    def backend(cls):
+        return Backend.NCCL
 
 
 def _get_comm_key_send_recv(my_rank, my_gpu_idx, peer_rank, peer_gpu_idx):
