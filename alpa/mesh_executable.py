@@ -1107,6 +1107,7 @@ class AllocZeroBufferWorkerExecutable(MeshWorkerExecutable):
         self.allocate_zero_buffers.delete()
 
 
+# This executable is deprecated.
 class MemzeroWorkerExecutable(MeshWorkerExecutable):
     """The worker part of an executable that sets all input tensors to zeros."""
 
@@ -1128,8 +1129,6 @@ class MemzeroWorkerExecutable(MeshWorkerExecutable):
         """Run the executable on the worker."""
         # pylint: disable=unused-argument
         buffer_dict = self.worker.buffers
-
-        #TODO(hexu): add synchronization for inputs? Do we really need this?
 
         # Get input
         input_bufs = [buffer_dict[x] for x in input_uuids]

@@ -139,7 +139,6 @@ class MeshHostWorker:
         self.num_devices = len(self.local_devices)
 
         self.buffers = {}  # Dict[uuid -> Sequence[DeviceArray]]
-        self.buffers_done_events = {} # Dict[uuid -> List[event]]
         self.executables = {}  # Dict[uud -> MeshWorkerExecutable]
 
         self.send_tasks = {}  # Dict[uuid -> ReshardingSendTask]
@@ -179,7 +178,7 @@ class MeshHostWorker:
                 split_datas.extend(split_buffers)
             datas = split_datas
         arys = [([None] * self.num_devices) for _ in range(num_batch)]
-        all_done_events = [[None for _ in range(self.num_devices)] for _ in range(num_batch)]
+        # FIXME(yonghao): add sync here
         for i, data in enumerate(datas):
             if data.dtype == np.int64:
                 data = data.astype(np.int32)
@@ -187,9 +186,8 @@ class MeshHostWorker:
             arys[batch_id][device_id] = (self.backend.buffer_from_pyval(
                 data, self.local_devices[device_id]))
 
-        for uuid, ary, done_events in zip(uuids, arys, all_done_events):
+        for uuid, ary in zip(uuids, arys):
             self.buffers[uuid] = ary
-            self.buffers_done_events[uuid] = done_events
 
     def shard_and_put_non_zero_buffer(self, uuids: Union[Sequence[int], int],
                                       shape: Sequence[int], dtype: np.dtype,
@@ -199,7 +197,7 @@ class MeshHostWorker:
         assert len(uuids) == num_batch
         assert len(indices) == self.num_devices * num_batch
         arys = [([None] * self.num_devices) for _ in range(num_batch)]
-        all_done_events = [[None for _ in range(self.num_devices)] for _ in range(num_batch)]
+        # FIXME(yonghao): add sync here
         for device_id in range(self.num_devices):
             for b in range(num_batch):
                 shard_shape = []
@@ -211,13 +209,13 @@ class MeshHostWorker:
                 arys[b][device_id] = (self.backend.buffer_from_pyval(
                     np.full(shard_shape, 1e-8, dtype),
                     self.local_devices[device_id]))
-        for uuid, ary, done_events in zip(uuids, arys, all_done_events):
+        for uuid, ary in zip(uuids, arys):
             self.buffers[uuid] = ary
-            self.buffers_done_events[uuid] = done_events
 
     def _get_buffers_with_local_ids(self, uuid: int, device_ids: Sequence[int]):
         bufs = self.buffers[uuid]
-        # done_events = self.buffers_done_events[uuid]
+        # TODO(yonghao): sync communication events. Currently it's safe because
+        # we never get values immediately after a cross-mesh communication.
         if device_ids is None:
             return map(np.asarray, bufs)
         elif not isinstance(device_ids, Iterable):
@@ -242,12 +240,8 @@ class MeshHostWorker:
         if isinstance(uuids, Iterable):
             for uuid in uuids:
                 del self.buffers[uuid]
-                if global_config.enable_overlapping:
-                    del self.buffers_done_events[uuid]
         else:
             del self.buffers[uuids]
-            if global_config.enable_overlapping:
-                del self.buffers_done_events[uuids]
 
     def block_until_ready_buffers(self, uuids: Union[Sequence[int], int]):
         # TODO(hexu): we need synchronize events here

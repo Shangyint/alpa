@@ -1735,10 +1735,3 @@ def synchronize_one_event(event, stream):
 def mark_event(stream, device_id):
     raise NotImplementedError()
 
-def host_wait_for_events(events):
-    for event in events:
-        if isinstance(event, xe.CudaEvent):# return se::Event
-            pass # there is not any case that needs host to synchronize xe.CudaEvent
-            # return xe.xla_cuda_host_sync_event(event)# create an event on gpus[device_id], then record on stream.
-        else:
-            return

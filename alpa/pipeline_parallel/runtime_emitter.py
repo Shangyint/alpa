@@ -499,11 +499,6 @@ class PipelineInstEmitter:
             src_idx, src_uuid = list(
                 self.env.get_var_meshes(invar, batch_idx).items())[0]
             resharding_task = self._resharding_tasks[src_idx][mesh_idx][var_key]
-
-            # self.mesh_instructions[src_idx].append(("resharding", resharding_task))
-            # self.mesh_instructions_interval[src_idx].append({worker:[-1,-1] for worker in src_idx.worker})
-            # TODO(hexu): finish this.
-
             if global_config.resharding_mode == "send_recv":
                 self._compile_resharding_task(src_uuid, resharding_task,
                                               recv_uuid, comm_lists)

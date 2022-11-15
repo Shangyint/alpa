@@ -129,6 +129,7 @@ class GroupManager:
 
 _group_mgr = GroupManager()
 
+
 def is_group_initialized(group_name):
     """Check if the group is initialized in this process by the group name."""
     return _group_mgr.is_group_exist(group_name)
@@ -837,32 +838,9 @@ def _check_root_tensor_valid(length, root_tensor):
         raise ValueError(f"root_tensor '{root_tensor}' is greater "
                          f"than the number of GPUs: '{length}'")
 
-def get_participated_streams(participated_devices,
-                             input_or_output_streams,
-                             group_name):
-    """get working streams for participated devices.
 
-    Args:
-        participated_devices: participated devices ids.
-        input_or_output_streams(List[bool]): True means input
-            stream, otherwise output stream
-
-    Returns:
-        None
-    """
-    g = _check_and_get_group(group_name)
-    participated_streams = []
-    for device, is_input in zip(participated_devices, input_or_output_streams):
-        participated_streams.append(g.input_xla_cuda_streams[device]
-                                    if is_input else g.output_xla_cuda_streams[device])
-    # print(participated_streams)
-    return participated_streams
-
-def get_all_streams(group_name):
-    g = _check_and_get_group(group_name)
-    participated_streams = list(g.input_xla_cuda_streams.values()) + list(g.input_xla_cuda_streams.values())
-    return participated_streams
-
+# FIXME(yonghao): remove it
 def get_stream(group_name, device_id, is_input):
     g = _check_and_get_group(group_name)
-    return g.input_xla_cuda_streams[device_id] if is_input else g.input_xla_cuda_streams[device_id]
+    return g.input_xla_cuda_streams[
+        device_id] if is_input else g.input_xla_cuda_streams[device_id]
