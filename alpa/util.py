@@ -1727,32 +1727,13 @@ def maybe_numba_jit(func):
 ########################################
 ##### cuda stream synchronization
 ########################################
-
-def synchronize_inputs_done_events(all_inputs_done_events, all_devices_working_streams):
-    for one_input_done_events in all_inputs_done_events:
-        for event, working_stream in zip(one_input_done_events, all_devices_working_streams):
-            # for stream in working_streams:
-            synchronize_one_event(event, working_stream)
-
+# FIXME: remove the two by rewriting behaviors in the slow path: create all tiles,
+# recv one by one, then concatenate all together
 def synchronize_one_event(event, stream):
-    if event is None:
-        return 
-    xe.stream_wait_for_event(stream, event)
-
-def mark_events(streams, devices):
-    events = []
-    for stream, device in zip(streams, devices):
-        events.append(mark_event(stream, device))
-    return events
+    raise NotImplementedError()
 
 def mark_event(stream, device_id):
-    if isinstance(stream, xe.XLACudaStream):
-        backend = override_get_backend()
-        event = xe.create_xla_cuda_event(backend, device_id)
-        xe.stream_record_event(stream, event)
-        return event
-    else:
-        return None
+    raise NotImplementedError()
 
 def host_wait_for_events(events):
     for event in events:

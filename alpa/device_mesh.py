@@ -55,8 +55,7 @@ from alpa.timer import timers, tracer
 from alpa.util import (benchmark_func, list_gpu_info, OrderedSet,
                        update_jax_platform, is_ray_node_resource,
                        try_import_ray_worker, create_placement_group,
-                       get_bundle_idx, retrieve_placement_group, get_bundle2ip,
-                       synchronize_inputs_done_events, mark_event)
+                       get_bundle_idx, retrieve_placement_group, get_bundle2ip)
 
 ray_worker = try_import_ray_worker()
 
@@ -435,32 +434,12 @@ class MeshHostWorker:
         self.recv_tasks[uuid] = ReshardingRecvTask(recv_specs=tasks,
                                                    group_name=group_name)
 
-    def get_devices_and_events(self, tile_specs, ary_uuid):
-        
-        participated_devices = sorted(set([
-            tile_spec.device_id for tile_spec in tile_specs]))
-        if ary_uuid in self.buffers_done_events:
-            inputs_done_events = [self.buffers_done_events[ary_uuid][device_id]
-                                for device_id in participated_devices]
-        else:
-            inputs_done_events = [None for _ in participated_devices]
-        # print(f"synchronize comm {ary_uuid} devices {participated_devices}")
-        return participated_devices, inputs_done_events
 
     def run_resharding_send_task(self, uuid, ary_uuid):
         task: ReshardingSendTask = self.send_tasks[uuid]
         if global_config.enable_overlapping:
-            participated_devices, inputs_done_events = (
-                self.get_devices_and_events(task.tile_specs, ary_uuid)
-            )
+            xe.communication_wait_events([uuid], self.num_devices, True)
 
-            input_or_output_streams = [False for _ in range(len(participated_devices))]
-            participated_streams = col.get_participated_streams(
-                participated_devices, input_or_output_streams, task.group_name)
-            synchronize_inputs_done_events([inputs_done_events],
-                                            participated_streams)
-
-        # self.sync_all()
         for send_tile_spec in task.tile_specs:
             send_tile_spec: ReshardingSendSpec
             self.send_tile(ary_uuid, send_tile_spec.device_id,
@@ -468,30 +447,14 @@ class MeshHostWorker:
                            send_tile_spec.tile_spec.rank,
                            send_tile_spec.tile_spec.gpu_idx, task.group_name)
 
-        if global_config.enable_overlapping:
-            for device_id, stream in zip(participated_devices, participated_streams):
-                self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
-                # print(f"mark event {ary_uuid} {device_id} -> {self.buffers_done_events[ary_uuid][device_id]}")
-                #TODO(hexu): will we continue to use it after sending it to other devices?
-
     def run_resharding_recv_task(self, uuid, ary_uuid, set_empty_buffer=True):
         task: ReshardingRecvTask = self.recv_tasks[uuid]
         if set_empty_buffer and ary_uuid not in self.buffers:
+            assert not global_config.enable_overlapping, "Unsupported."
             self.buffers[ary_uuid] = [None] * self.num_devices
-            if global_config.enable_overlapping:
-                self.buffers_done_events[ary_uuid] = [None] * self.num_devices
 
         if global_config.enable_overlapping:
-            participated_devices, inputs_done_events = (
-                self.get_devices_and_events(task.recv_specs, ary_uuid)
-            )
-
-            input_or_output_streams = [True for _ in range(len(participated_devices))]
-            participated_streams = col.get_participated_streams(
-                participated_devices, input_or_output_streams, task.group_name)
-            # print(inputs_done_events, participated_streams)
-            synchronize_inputs_done_events([inputs_done_events],
-                                            participated_streams)
+            xe.communication_wait_events([uuid], self.num_devices, False)
 
         buffers = self.buffers[ary_uuid]
         for recv_spec in task.recv_specs:
@@ -501,10 +464,6 @@ class MeshHostWorker:
                 buffers[device_id] = self.backend.buffer_from_pyval(
                     np.full(recv_spec.shape, 1e-8, recv_spec.dtype),
                     self.local_devices[device_id])
-                self.buffers_done_events[ary_uuid][device_id] = None
-            # TODO(hexu): is this asynchroneous? I think it is, 
-            # we need an event for it. But it seems that we never
-            # set_empty_buffer to True.
 
             for recv_tile_spec in recv_spec.tile_specs:
                 recv_tile_spec: ReshardingTileSpec
@@ -513,8 +472,7 @@ class MeshHostWorker:
                                task.group_name)
 
         if global_config.enable_overlapping:
-            for device_id, stream in zip(participated_devices, participated_streams):
-                self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
+            xe.communicator_record_event([uuid], self.num_devices, False)
 
     def send_tile(self, uuid: int, device_id: int, offset: Sequence[slice],
                   dst_rank: int, dst_gpu_idx: int, group_name: str):
@@ -560,6 +518,7 @@ class MeshHostWorker:
         task: ReshardingBroadcastTask = self.broadcast_tasks[uuid]
         broadcast_specs = task.broadcast_specs
         if set_empty_buffer and ary_uuid not in self.buffers:
+            assert not global_config.enable_overlapping, "Unsupported."
             picked_spec = list(broadcast_specs.values())[0]
             shape = picked_spec.recv_tile_shape
             dtype = picked_spec.dtype
@@ -568,27 +527,10 @@ class MeshHostWorker:
                                                self.local_devices[device_id])
                 for device_id in range(self.num_devices)
             ]
-            self.buffers_done_events[ary_uuid] = None
 
         if global_config.enable_overlapping:
-            participated_devices = set()
-            for broadcast_spec in broadcast_specs.values():
-                participated_devices.update(broadcast_spec.devices_ids)
-            participated_devices = sorted(participated_devices)
-
-            inputs_done_events = (
-                self.buffers_done_events[ary_uuid][device_id]
-                for device_id in participated_devices
-            )
-            # The rank 0 should use output streams
-            # TODO: add some assertion to avoid incompatible state
-            is_receiver = broadcast_spec.devices_global_rank[0] != 0
-            input_or_output_streams = [is_receiver] * len(participated_devices)
-            participated_streams = col.get_participated_streams(
-                participated_devices, input_or_output_streams, task.group_name)
-            synchronize_inputs_done_events([inputs_done_events],
-                                            participated_streams)
-
+            is_send = broadcast_spec.devices_global_rank[0] == 0
+            xe.communication_wait_events([uuid], self.num_devices, is_send)
 
         for group_idx in broadcast_specs:
             broadcast_spec: ReshardingBroadcastSpec = broadcast_specs[group_idx]
@@ -599,11 +541,8 @@ class MeshHostWorker:
                                        broadcast_spec.devices_global_rank,
                                        broadcast_spec.tensor_slices,
                                        task.group_name)
-        if global_config.enable_overlapping:
-            for device_id, stream in zip(participated_devices,
-                                         participated_streams):
-                self.buffers_done_events[ary_uuid][device_id] = mark_event(stream, device_id)
-                # TODO(hexu): I might have to create two events for both streams. 
+        if global_config.enable_overlapping and not is_send:
+            xe.communicator_record_event([uuid], self.num_devices, False)
 
     ##### Profiling and Debugging Related Functions #####
     def profile_hlo_ops(self, op_infos: Sequence[Any], cache_filename: str,
