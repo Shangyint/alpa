@@ -37,6 +37,8 @@ class NCCLGroup(BaseGroup):
 
         # TODO(Fu): might need an event map
         self._dev_event_map = {}
+        # This is only for cross-mesh all-reduce to use
+        self.xla_comm_group = None
 
         if nccl_util.get_nccl_build_version() < 2000:
             raise RuntimeError("NCCL in Ray requires NCCL >= 2.0.")
@@ -449,13 +451,14 @@ class NCCLGroup(BaseGroup):
 
         if lib == "xla":
             # FIXME: pass the start rank at the initial point
+            if self.xla_comm_group is not None:
+                return self.xla_comm_group
             start_rank = self.rank * len(device_list)
             actual_ranks = [start_rank + i for i in range(len(device_list))]
-            local_ids = list(range(len(device_list)))
+            xla_extension.create_cross_mesh_communicator(
+                actual_world_size, actual_ranks, len(device_list), nccl_uid)
             self.xla_comm_group = xla_extension.CommGroup(None)
-            # FIXME: fix this
-            self.xla_comm_group.nccl_create_communicators(
-                actual_world_size, actual_ranks, local_ids, nccl_uid)
+            return self.xla_comm_group
         nccl_util.groupStart()
         for i, device in enumerate(device_list):
             actual_rank = self.rank * len(device_list) + i
@@ -475,9 +478,13 @@ class NCCLGroup(BaseGroup):
         self._dev_event_map[comm_key] = events
         return comms
 
-    def create_nccl_collective_communicator(self, devices, lib="cupy"):
+    def create_nccl_collective_communicator(self, devices):
         key = _get_comm_key_from_devices(devices)
-        return self._get_nccl_collective_communicator(key, devices, lib)
+        self._get_nccl_collective_communicator(key, devices)
+
+    def create_and_set_xla_communicators(self, devices):
+        key = _get_comm_key_from_devices(devices)
+        self._get_nccl_collective_communicator(key, devices, "xla")
 
     @staticmethod
     def _sync_streams(device_list, events, streams):

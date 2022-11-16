@@ -419,9 +419,7 @@ class MeshHostWorker:
             self.init_collective_group(world_size, rank, backend, group_name)
         g = col.check_and_get_group(group_name)
         devices = list(range(self.num_devices))
-        # FIXME(yonghao): fix this
-        comms = g.create_nccl_collective_communicator(devices, "xla")
-        xe.set_cross_mesh_communicator(comms, "")
+        g.create_and_set_xla_communicators(devices)
 
     def put_resharding_send_task(self, uuid, tasks, group_name):
         self.send_tasks[uuid] = ReshardingSendTask(tile_specs=tasks,
@@ -528,12 +526,13 @@ class MeshHostWorker:
                 for device_id in range(self.num_devices)
             ]
 
-        if global_config.enable_overlapping:
-            is_send = broadcast_spec.devices_global_rank[0] == 0
-            col.wait_events(group_name, [uuid], self.num_devices, is_send)
-
+        has_recv = False
         for group_idx in broadcast_specs:
             broadcast_spec: ReshardingBroadcastSpec = broadcast_specs[group_idx]
+            is_send = broadcast_spec.devices_global_rank[0] == 0
+            has_recv = has_recv or not is_send
+            if global_config.enable_overlapping:
+                col.wait_events(group_name, [uuid], self.num_devices, is_send)
 
             worker_nccl_util.broadcast(self, ary_uuid, broadcast_spec.comm_key,
                                        broadcast_spec.world_size,
@@ -541,7 +540,7 @@ class MeshHostWorker:
                                        broadcast_spec.devices_global_rank,
                                        broadcast_spec.tensor_slices,
                                        task.group_name)
-        if global_config.enable_overlapping and not is_send:
+        if global_config.enable_overlapping and has_recv:
             col.record_events(group_name, [uuid], self.num_devices, False)
 
     ##### Profiling and Debugging Related Functions #####
