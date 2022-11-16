@@ -26,58 +26,43 @@ class XLANCCLGroup(BaseGroup):
         super().__init__(world_size, rank, group_name)
 
         # communicator and stream cache.
-        # TODO (Hao): we need a lock here...
-        self._barrier_tensor = None
         self.use_default_stream = not global_config.enable_overlapping
-        self._dev_comm_map = {}
+        self._dev_comm_names = set()
 
         # record the used GPU IDs.
         self._used_gpu_indices = set()
 
-        self.input_xla_cuda_streams = {}
-        self.output_xla_cuda_streams = {}
-
         backend = override_get_backend()
-        # print(backend)
-        self.initialize_streams(backend)
-
-        # TODO(Fu): might need an event map
-        self._dev_event_map = {}
+        self.xla_comm_group = xe.CommGroup(backend)
 
         if xla_nccl_util.get_nccl_runtime_version() < 2704:
             logger.warning("NCCL send/recv calls requires NCCL>=2.7.4")
 
-    def initialize_streams(self, backend):
-        if not self.use_default_stream:
-            xe.nccl_create_streams(backend, range(backend.local_device_count()))
-
     def destroy_group(self):
         """Destroy the group and release NCCL communicators."""
-        if len(self._dev_comm_map) > 0:
+        self._dev_comm_names = list(self._dev_comm_names)
+        if len(self._dev_comm_names) > 0:
 
             # Destroy the communicators and streams.
-            for comm_key in self._dev_comm_map:
-                xe.nccl_destroy_comms(comm_key)
-                self._dev_comm_map[comm_key] = None
+            for comm_key in self._dev_comm_names:
+                self.xla_comm_group.nccl_destroy_comms(comm_key)
 
         if self.rank == 0:
-            for comm_key in self._dev_comm_map:
-                assert not self._dev_comm_map[comm_key]
+            for comm_key in self._dev_comm_names:
                 group_key = self._generate_group_key(comm_key)
                 self._destroy_store(group_key)
-        self._barrier_tensor = None
-        self._dev_comm_map = None
+        self._dev_comm_names = None
 
     # functions to get communicator:
-    def _get_nccl_broadcast_communicator(self,
-                                         comm_key,
-                                         world_size,
-                                         devices_ids,
-                                         devices_global_rank,
-                                         nccl_uid=None):
+    def create_nccl_broadcast_communicator(self,
+                                            comm_key,
+                                            world_size,
+                                            devices_ids,
+                                            devices_global_rank,
+                                            nccl_uid=None):
         """Create or retrieve a list of NCCL communicators for
         broadcast from cache. Here we only use partial devices in a host, so
-        we create this function besides _get_nccl_collective_communicator.
+        we create this function besides _create_nccl_collective_communicator.
 
         If the communicator is found in cache, return the communicator. If not,
         a communicator and a stream will be created and put in cache.
@@ -98,12 +83,12 @@ class XLANCCLGroup(BaseGroup):
         if not comm_key:
             raise RuntimeError("Got empty communicator key.")
 
+        # TODO(Hao): lock the _dev_comm_map here.
+        if comm_key in self._dev_comm_names:
+            return
+
         for d in devices_ids:
             self._used_gpu_indices.add(d)
-
-        # TODO(Hao): lock the _dev_comm_map here.
-        if comm_key in self._dev_comm_map:
-            return self._dev_comm_map[comm_key]
 
         group_key = self._generate_group_key(comm_key)
         if devices_global_rank[0] == 0:
@@ -124,12 +109,12 @@ class XLANCCLGroup(BaseGroup):
                         "destroyed.")
                     rendezvous.destroy_store()
 
-        comms = xe.nccl_create_communicators(world_size, devices_global_rank,
-                                             devices_ids, nccl_uid)
-        self._dev_comm_map[comm_key] = comms
-        return comms
+        self.xla_comm_group.nccl_create_communicators(world_size,
+                                                      devices_global_rank,
+                                                      devices_ids, nccl_uid)
+        self._dev_comm_names.add(comm_key)
 
-    def _get_nccl_collective_communicator(self,
+    def _create_nccl_collective_communicator(self,
                                           comm_key,
                                           device_list):
         """Create or retrieve an NCCL communicator from cache.
@@ -152,8 +137,8 @@ class XLANCCLGroup(BaseGroup):
             self._used_gpu_indices.add(d)
 
         # TODO(Hao): lock the _dev_comm_map here.
-        if comm_key in self._dev_comm_map:
-            return self._dev_comm_map[comm_key]
+        if comm_key in self._dev_comm_names:
+            return
 
         group_key = self._generate_group_key(comm_key)
         if self.rank == 0:
@@ -178,18 +163,18 @@ class XLANCCLGroup(BaseGroup):
         start_rank = self.rank * len(device_list)
         actual_ranks = [start_rank + i for i in range(len(device_list))]
         local_ids = list(range(len(device_list)))
-        comms = xe.nccl_create_communicators(
+        comms = self.xla_comm_group.nccl_create_communicators(
             actual_world_size, actual_ranks, local_ids, nccl_uid)
 
-        self._dev_comm_map[comm_key] = comms
+        self._dev_comm_names.add(comm_key)
         return comms
 
-    def get_nccl_collective_communicator(self, devices, lib):
+    def create_nccl_collective_communicator(self, devices, lib):
         key = _get_comm_key_from_devices(devices)
         assert lib == "xla"
-        return self._get_nccl_collective_communicator(key, devices)
+        self._create_nccl_collective_communicator(key, devices)
 
-    def _get_nccl_p2p_communicator(self,
+    def _create_nccl_p2p_communicator(self,
                                    comm_key,
                                    my_gpu_idx,
                                    peer_rank,
@@ -210,8 +195,8 @@ class XLANCCLGroup(BaseGroup):
             raise RuntimeError("Got empty communicator key.")
 
         # TODO(Hao): lock the _dev_comm_map here.
-        if comm_key in self._dev_comm_map:
-            return self._dev_comm_map[comm_key]
+        if comm_key in self._dev_comm_names:
+            return
 
         # Note (Hao): This is a bit complex so I decide to take a note here.
         # Here we need to consider three cases:
@@ -253,9 +238,9 @@ class XLANCCLGroup(BaseGroup):
                         "destroyed.")
                     rendezvous.destroy_store()
 
-        comms = xe.nccl_create_communicators(2, [my_p2p_rank], [my_gpu_idx],
-                                             nccl_uid)
-        self._dev_comm_map[comm_key] = comms
+        comms = self.xla_comm_group.nccl_create_communicators(
+            2, [my_p2p_rank], [my_gpu_idx], nccl_uid)
+        self._dev_comm_names.add(comm_key)
         return comms
 
     def create_p2p_communicator(self,
@@ -277,8 +262,8 @@ class XLANCCLGroup(BaseGroup):
         """
         comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
                                            peer_gpu_idx)
-        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                        peer_gpu_idx, nccl_uid)
+        self._create_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+                                           peer_gpu_idx, nccl_uid)
 
     # communicate operations
     def broadcast_partialgpu(self,
@@ -297,14 +282,14 @@ class XLANCCLGroup(BaseGroup):
         root_rank = 0
 
         key = broadcast_options.comm_key
-        self._get_nccl_broadcast_communicator(
+        self.create_nccl_broadcast_communicator(
             key, broadcast_options.world_size, broadcast_options.devices_ids,
             broadcast_options.devices_global_rank)
         is_receiver = broadcast_options.devices_global_rank[0] != 0
-        xe.nccl_broadcast_partial_gpus(key, tensors,
-                                       broadcast_options.local_start_pos_list,
-                                       broadcast_options.n_elements, root_rank,
-                                       is_receiver, self.use_default_stream)
+        self.xla_comm_group.nccl_broadcast_partial_gpus(
+            key, tensors, broadcast_options.local_start_pos_list,
+            broadcast_options.n_elements, root_rank, is_receiver,
+            self.use_default_stream)
 
     def send(self, tensors, send_options=SendOptions()):
         """Send a tensor to a destination gpu in the group.
@@ -323,13 +308,13 @@ class XLANCCLGroup(BaseGroup):
             send_options.dst_rank, send_options.dst_gpu_index
         comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
                                            peer_gpu_idx)
-        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+        self._create_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
                                         peer_gpu_idx)
 
         peer_p2p_rank = 0 if self.rank > peer_rank else 1
-        xe.nccl_send(comm_key, buffer, send_options.start_pos,
-                     send_options.n_elements, peer_p2p_rank,
-                     self.use_default_stream)
+        self.xla_comm_group.nccl_send(comm_key, buffer, send_options.start_pos,
+                                      send_options.n_elements, peer_p2p_rank,
+                                      self.use_default_stream)
 
     def recv(self, tensors, recv_options=RecvOptions()):
         """Receive a tensor from a source gpu in the group.
@@ -348,13 +333,27 @@ class XLANCCLGroup(BaseGroup):
             recv_options.src_rank, recv_options.src_gpu_index
         comm_key = _get_comm_key_send_recv(self.rank, my_gpu_idx, peer_rank,
                                            peer_gpu_idx)
-        self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
-                                        peer_gpu_idx)
+        self._create_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
+                                           peer_gpu_idx)
 
         peer_p2p_rank = 0 if self.rank > peer_rank else 1
-        xe.nccl_recv(comm_key, buffer, recv_options.start_pos,
-                     recv_options.n_elements, peer_p2p_rank,
-                     self.use_default_stream)
+        self.xla_comm_group.nccl_recv(comm_key, buffer, recv_options.start_pos,
+                                      recv_options.n_elements, peer_p2p_rank,
+                                      self.use_default_stream)
+
+    def record_events(self, uuids, num_devices, is_send):
+        """Record events for all devices on send/recv streams."""
+        self.xla_comm_group.record_events(uuids, num_devices, is_send)
+
+    def wait_events(self, uuids, num_devices, is_send):
+        """Wait events for all devices on send/recv streams."""
+        self.xla_comm_group.wait_events(uuids, num_devices, is_send)
+
+    def comm_wait_compute(self, is_send, is_compute, device_id):
+        self.xla_comm_group.comm_wait_compute(is_send, is_compute, device_id)
+
+    def compute_wait_comm(self, is_send, is_compute, device_id):
+        self.xla_comm_group.compute_wait_comm(is_send, is_compute, device_id)
 
     # helper functions to build communicatiors
     def _generate_group_key(self, comm_key):

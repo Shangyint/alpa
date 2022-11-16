@@ -137,6 +137,8 @@ class MeshHostWorker:
         set_override_backend(self.backend)
         self.local_devices = self.backend.local_devices()
         self.num_devices = len(self.local_devices)
+        if global_config.enable_overlapping:
+            xe.set_num_device_on_host(self.num_devices)
 
         self.buffers = {}  # Dict[uuid -> Sequence[DeviceArray]]
         self.executables = {}  # Dict[uud -> MeshWorkerExecutable]
@@ -403,8 +405,8 @@ class MeshHostWorker:
         """Initialize the P2P communicator from within the mesh workers."""
         assert col.is_group_initialized(group_name)
         g = col.check_and_get_group(group_name)
-        g._get_nccl_broadcast_communicator(comm_key, world_size, device_ids,
-                                           devices_global_rank, nccl_uid)
+        g.create_nccl_broadcast_communicator(comm_key, world_size, device_ids,
+                                             devices_global_rank, nccl_uid)
 
     @staticmethod
     def destroy_collective_group(group_name: str = "default"):
@@ -417,7 +419,8 @@ class MeshHostWorker:
             self.init_collective_group(world_size, rank, backend, group_name)
         g = col.check_and_get_group(group_name)
         devices = list(range(self.num_devices))
-        comms = g.get_nccl_collective_communicator(devices, "xla")
+        # FIXME(yonghao): fix this
+        comms = g.create_nccl_collective_communicator(devices, "xla")
         xe.set_cross_mesh_communicator(comms, "")
 
     def put_resharding_send_task(self, uuid, tasks, group_name):
@@ -431,8 +434,9 @@ class MeshHostWorker:
 
     def run_resharding_send_task(self, uuid, ary_uuid):
         task: ReshardingSendTask = self.send_tasks[uuid]
+        group_name = task.group_name
         if global_config.enable_overlapping:
-            xe.communication_wait_events([uuid], self.num_devices, True)
+            col.wait_events(group_name, [uuid], self.num_devices, True)
 
         for send_tile_spec in task.tile_specs:
             send_tile_spec: ReshardingSendSpec
@@ -443,12 +447,13 @@ class MeshHostWorker:
 
     def run_resharding_recv_task(self, uuid, ary_uuid, set_empty_buffer=True):
         task: ReshardingRecvTask = self.recv_tasks[uuid]
+        group_name = task.group_name
         if set_empty_buffer and ary_uuid not in self.buffers:
             assert not global_config.enable_overlapping, "Unsupported."
             self.buffers[ary_uuid] = [None] * self.num_devices
 
         if global_config.enable_overlapping:
-            xe.communication_wait_events([uuid], self.num_devices, False)
+            col.wait_events(group_name, [uuid], self.num_devices, False)
 
         buffers = self.buffers[ary_uuid]
         for recv_spec in task.recv_specs:
@@ -466,7 +471,7 @@ class MeshHostWorker:
                                task.group_name)
 
         if global_config.enable_overlapping:
-            xe.communicator_record_event([uuid], self.num_devices, False)
+            col.record_events(group_name, [uuid], self.num_devices, False)
 
     def send_tile(self, uuid: int, device_id: int, offset: Sequence[slice],
                   dst_rank: int, dst_gpu_idx: int, group_name: str):
@@ -510,6 +515,7 @@ class MeshHostWorker:
                                       ary_uuid,
                                       set_empty_buffer=True):
         task: ReshardingBroadcastTask = self.broadcast_tasks[uuid]
+        group_name = task.group_name
         broadcast_specs = task.broadcast_specs
         if set_empty_buffer and ary_uuid not in self.buffers:
             assert not global_config.enable_overlapping, "Unsupported."
@@ -524,7 +530,7 @@ class MeshHostWorker:
 
         if global_config.enable_overlapping:
             is_send = broadcast_spec.devices_global_rank[0] == 0
-            xe.communication_wait_events([uuid], self.num_devices, is_send)
+            col.wait_events(group_name, [uuid], self.num_devices, is_send)
 
         for group_idx in broadcast_specs:
             broadcast_spec: ReshardingBroadcastSpec = broadcast_specs[group_idx]
@@ -536,7 +542,7 @@ class MeshHostWorker:
                                        broadcast_spec.tensor_slices,
                                        task.group_name)
         if global_config.enable_overlapping and not is_send:
-            xe.communicator_record_event([uuid], self.num_devices, False)
+            col.record_events(group_name, [uuid], self.num_devices, False)
 
     ##### Profiling and Debugging Related Functions #####
     def profile_hlo_ops(self, op_infos: Sequence[Any], cache_filename: str,

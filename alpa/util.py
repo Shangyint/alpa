@@ -41,7 +41,7 @@ import tqdm
 import alpa
 from alpa.global_env import global_config, is_worker
 from alpa.monkey_patch import (restore_random, monkey_patch_random,
-                               rng_primitives, override_get_backend)
+                               rng_primitives)
 from alpa.wrapped_hlo import HloStatus, WrappedHlo
 
 PLACEMENT_GROUP_TIMEOUT_S_ENV = "ALPA_PLACEMENT_GROUP_TIMEOUT_S_ENV"
@@ -1722,16 +1722,3 @@ def maybe_numba_jit(func):
     except ImportError:
         logger.warning("Install numba to jit and accelerate the function.")
         return func
-
-
-########################################
-##### cuda stream synchronization
-########################################
-# FIXME: remove the two by rewriting behaviors in the slow path: create all tiles,
-# recv one by one, then concatenate all together
-def synchronize_one_event(event, stream):
-    raise NotImplementedError()
-
-def mark_event(stream, device_id):
-    raise NotImplementedError()
-

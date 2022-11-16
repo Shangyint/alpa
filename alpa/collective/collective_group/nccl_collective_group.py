@@ -452,7 +452,9 @@ class NCCLGroup(BaseGroup):
             start_rank = self.rank * len(device_list)
             actual_ranks = [start_rank + i for i in range(len(device_list))]
             local_ids = list(range(len(device_list)))
-            comms = xla_extension.nccl_create_communicators(
+            self.xla_comm_group = xla_extension.CommGroup(None)
+            # FIXME: fix this
+            self.xla_comm_group.nccl_create_communicators(
                 actual_world_size, actual_ranks, local_ids, nccl_uid)
         nccl_util.groupStart()
         for i, device in enumerate(device_list):
@@ -473,7 +475,7 @@ class NCCLGroup(BaseGroup):
         self._dev_event_map[comm_key] = events
         return comms
 
-    def get_nccl_collective_communicator(self, devices, lib="cupy"):
+    def create_nccl_collective_communicator(self, devices, lib="cupy"):
         key = _get_comm_key_from_devices(devices)
         return self._get_nccl_collective_communicator(key, devices, lib)
 
@@ -687,6 +689,15 @@ class NCCLGroup(BaseGroup):
                                            peer_gpu_idx)
         self._get_nccl_p2p_communicator(comm_key, my_gpu_idx, peer_rank,
                                         peer_gpu_idx, nccl_uid)
+
+    def create_nccl_broadcast_communicator(self,
+                                           comm_key,
+                                           world_size,
+                                           devices_ids,
+                                           devices_global_rank,
+                                           nccl_uid=None):
+        self._get_nccl_broadcast_communicator(comm_key, world_size, devices_ids,
+                                              devices_global_rank, nccl_uid)
 
     def _point2point(self, tensors, p2p_fn, peer_rank: int, peer_gpu_idx: int):
         """A method to encapsulate all peer-to-peer calls (i.e., send/recv).
