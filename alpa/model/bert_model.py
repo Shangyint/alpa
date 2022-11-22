@@ -6,6 +6,11 @@ from typing import Callable
 
 import numpy as np
 
+import sys
+import os.path
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
+
 from flax import linen as nn, optim
 import jax
 from jax import lax
@@ -781,6 +786,25 @@ class FlaxBertForSequenceClassificationModule(nn.Module):
         )
 
 
+def test_bert_sparse():
+    empty_config = BertConfig()
+    batch_size = 64
+    seq_len = 64
+    # Init model and optimizer
+    input_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    token_type_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    position_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    labels = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+
+    model = FlaxBertForMaskedLMModule(BertConfig())
+    rngkey = jax.random.PRNGKey(0)
+    params = model.init(rngkey, input_ids, attention_mask, token_type_ids,
+                        position_ids)
+    print(params)
+    
+
+
 def test_bert_layer():
     batch_size = 64
     seq_len = 64
@@ -876,7 +900,6 @@ def test_bert_mlm():
     params = model.init(rngkey, input_ids, attention_mask, token_type_ids,
                         position_ids)
     optimizer = optim.GradientDescent(1e-2).create(params)
-
     # JIT compile
     train_step(
         optimizer, {
@@ -887,8 +910,8 @@ def test_bert_mlm():
             "labels": labels,
             "rng": rngkey
         }, model.apply)
-
+    print(params)
 
 if __name__ == "__main__":
     #test_bert_layer()
-    test_bert_mlm()
+    test_bert_sparse()
