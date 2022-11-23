@@ -16,6 +16,8 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
+from flax.core.frozen_dict import FrozenDict
+
 from alpa.model.model_util import (FlaxBaseModelOutput,
                                    FlaxBaseModelOutputWithPooling,
                                    FlaxBertForPreTrainingOutput,
@@ -785,6 +787,15 @@ class FlaxBertForSequenceClassificationModule(nn.Module):
             attentions=outputs.attentions,
         )
 
+def explore_params(params, prefix=""):
+    res = []
+    for k, v in params.items():
+        if isinstance(v, FrozenDict):
+            s = f"{k}.{explore_params(v, prefix+'.'+k if len(prefix) else k)}"
+        else:
+            print(prefix + "." +  k + " " + str(v.shape))
+            
+
 
 def test_bert_sparse():
     empty_config = BertConfig()
@@ -797,11 +808,12 @@ def test_bert_sparse():
     position_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
     labels = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
 
-    model = FlaxBertForMaskedLMModule(BertConfig())
+    model = FlaxBertForSequenceClassificationModule(BertConfig())
     rngkey = jax.random.PRNGKey(0)
     params = model.init(rngkey, input_ids, attention_mask, token_type_ids,
                         position_ids)
-    print(params)
+    # print(type(params))
+    # explore_params(params)
     
 
 
