@@ -8,6 +8,9 @@ from flax import linen as nn, optim
 import jax
 from jax import lax
 import jax.numpy as jnp
+from jax.tools.jax_to_ir import jax_to_ir
+
+
 
 from flax.core.frozen_dict import FrozenDict
 
@@ -126,6 +129,7 @@ def evaluate(model, tokenizer, params, prefix=""):
         eval_dataloader = DataLoader(
             eval_dataset,
             sampler=eval_sampler,
+            drop_last=True,
             batch_size=32)
 
         # Eval!
@@ -138,20 +142,19 @@ def evaluate(model, tokenizer, params, prefix=""):
         out_label_ids = None
         loss = 0.0
 
-        for batch in tqdm(eval_dataloader, desc="Evaluating"):
-            batch = tuple(t for t in batch)
-
+        @partial(jax.jit, static_argnums=(1,))
+        def eval_step(batch, apply_fn):
             inputs = {
-                "input_ids": batch[0].numpy(),
-                "attention_mask": batch[1].numpy()}
+                "input_ids": batch[0],
+                "attention_mask": batch[1]}
             inputs["position_ids"] = jnp.ones((32, max_seq_length), dtype=jnp.int32)
             
-            inputs["token_type_ids"] = batch[2].numpy()
+            inputs["token_type_ids"] = batch[2]
                     # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
 
-            outputs = model.apply(params, **inputs)
+            outputs = apply_fn(params, **inputs)
             logits = outputs[0]
-            labels_data = batch[3].numpy() 
+            labels_data = batch[3]
             label_mask = jnp.where(labels_data > 0, 1.0, 0.0)
             labels = jax.nn.one_hot(labels_data, logits.shape[-1])
 
@@ -159,21 +162,18 @@ def evaluate(model, tokenizer, params, prefix=""):
                             axis=-1)
             loss = (label_mask * loss).sum() / label_mask.sum()
 
-        
-        from scipy.special import softmax
-
-        probs = softmax(preds, axis=-1)
-        entropy = jnp.exp((-probs * np.log(probs)).sum(axis=-1).mean())
-        preds = jnp.argmax(preds, axis=1)
-        # import pdb; pdb.set_trace()
-        # result = compute_metrics(eval_task, preds, out_label_ids)
-        # results.update(result)
-        results[eval_task] = (preds == out_label_ids).mean()
-        # if entropy is not None:
-        #     result["eval_avg_entropy"] = entropy
-
-        # output_eval_file = os.path.join(
-        #     eval_output_dir, prefix, "eval_results.txt")
+        flag = True
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            print
+            if flag:
+                flag = False
+                print("Here")
+                s = jax_to_ir(eval_step, [("batch", batch)], constants={"apply_fn": model.apply}, format='HLO')[1]
+                print(s)
+                with open("jax_ir", "w") as f:
+                    f.write(s)
+            batch = tuple(t.numpy() for t in batch)
+            eval_step(batch, model.apply)
 
     return results
 
