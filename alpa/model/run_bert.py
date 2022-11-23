@@ -42,6 +42,7 @@ def convert_from_pytorch(pt_state, config: BertConfig):
 
     # Need to change some parameters name to match Flax names so that we don't have to fork any layer
     for key, tensor in pt_state.items():
+        key = "params." + key
         # Key parts
         key_parts = set(key.split("."))
         tensor = tensor.numpy()
@@ -83,8 +84,8 @@ def convert_from_pytorch(pt_state, config: BertConfig):
                 new_key = key
                 if "weight" in key:
                     new_key = new_key.replace("weight", "scale")
-                elif "bias" in key:
-                    new_key = new_key.replace("bias", "beta")
+                # elif "bias" in key:
+                #     new_key = new_key.replace("bias", "beta")
 
                 jax_state[new_key] = tensor
     
@@ -95,6 +96,68 @@ def convert_from_pytorch(pt_state, config: BertConfig):
     for k, v in jax_state.items():
         print(k, v.shape)
     return jax_state
+
+
+def flatten(p, label=None):
+  if isinstance(p, FrozenDict):
+    for k, v in p.items():
+      yield from flatten(v, k if label is None else f"{label}.{k}")
+  else:
+    yield (label, p)
+
+def load_from_pytorch_state(flattened_params, jax_state):
+    for k, v in jax_state.items():
+        if k in flattened_params:
+            print(f"copying {k} with {v.shape} to {flattened_params[k].shape}")
+            flattened_params[k] = jax_state[k]
+        else:
+            print(f"not found {k}")
+    return flattened_params
+
+def jax_state_qkv_combined(jax_state):
+    return_state = dict(jax_state)
+    qvk_kernel = dict()
+    qvk_bias = dict()
+    for k, v in jax_state.items():
+        k_split = k.split(".")
+        key_parts = set(k_split)
+        if tmp := ({"query", "key", "value"} & key_parts):
+            if "kernel" in k:
+                del return_state[k]
+                qvk_kernel.setdefault(k_split[k_split.index("layer")+1], {})[tmp.pop()] = v
+            elif "bias" in k:
+                del return_state[k]
+                qvk_bias.setdefault(k_split[k_split.index("layer")+1], {})[tmp.pop()] = v
+    
+    for k, v in qvk_kernel.items():
+        return_state[f"params.bert.encoder.layer.{k}.attention.self.qvk_combined.kernel"] = jnp.concatenate([v["query"], v["value"], v["key"]], axis=1)
+    
+    for k, v in qvk_bias.items():
+        return_state[f"params.bert.encoder.layer.{k}.attention.self.qvk_combined.bias"] = jnp.concatenate([v["query"], v["value"], v["key"]], axis=0)
+
+    return return_state   
+
+
+from collections import defaultdict
+from functools import reduce
+from operator import getitem 
+
+def getitem_nested(d, keys):
+    return reduce(getitem, keys, d)
+
+def default_to_frozen(d):
+    if isinstance(d, defaultdict):
+        return FrozenDict({k: default_to_frozen(v) for k, v in d.items()})
+    else:
+        return d
+
+def convert_flattend_params(flattened_params):
+    tree = lambda: defaultdict(tree)
+    return_state = tree()
+    for k, v in flattened_params.items():
+        * keys, final_key = k.split('.')
+        getitem_nested(return_state, keys)[final_key] = v
+    return default_to_frozen(return_state)
 
 def test_bert_sparse():
     config = BertConfig(num_labels=2)
@@ -109,16 +172,19 @@ def test_bert_sparse():
 
     pystate = torch.load(os.path.join(checkpoint_path, "bert_coarse_no_propagation_pytorch.pth"))
     jax_state = convert_from_pytorch(pystate, config)
-    explore_params(jax_state)
+    # explore_params(jax_state)
 
 
     model = FlaxBertForSequenceClassificationModule(config)
     rngkey = jax.random.PRNGKey(0)
     params = model.init(rngkey, input_ids, attention_mask, token_type_ids,
                         position_ids)
-    # print(type(params))
+    flattened_params = dict(flatten(params))
+    jax_state = jax_state_qkv_combined(jax_state)
+    sparsified_params = load_from_pytorch_state(flattened_params, jax_state)
+
+    params = convert_flattend_params(sparsified_params)
     explore_params(params)
-    # print(params)
 
 if __name__ == "__main__":
     test_bert_sparse()
