@@ -22,8 +22,22 @@ from alpa.pipeline_parallel.primitive_def import mark_pipeline_boundary
 
 from bert_model import BertConfig, FlaxBertForSequenceClassificationModule
 
-checkpoint_path = "/home/shangyin/Research/SparTA/script/checkpoints/bert"
+from transformers import BertTokenizer
+from transformers import glue_output_modes as output_modes
+from transformers import glue_processors as processors
+from transformers import glue_convert_examples_to_features as convert_examples_to_features
+
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+
+from tqdm import tqdm, trange
+
 import torch
+
+checkpoint_path = "/home/shangyin/Research/SparTA/script/checkpoints/bert"
+data_dir = '/home/shangyin/Research/SparTA/script/checkpoints/bert/glue_data/QQP'
+model_name_or_path = '../training/result/qqp_partial/coarse_0.3/checkpoint-220000/'
+max_seq_length= 128
+
 
 def convert_to_sparsity(t):
     return [t.shape, float(1 - jnp.count_nonzero(t)/jnp.size(t))]
@@ -36,6 +50,132 @@ def explore_params(params, prefix=""):
         else:
             print(prefix + "." +  k + " " + str(convert_to_sparsity(v)))
 
+
+
+def load_and_cache_examples(task, tokenizer, evaluate=False):
+    
+    processor = processors[task]()
+    output_mode = output_modes[task]
+    # Load data features from cache or dataset file
+    cached_features_file = os.path.join(
+        data_dir,
+        "cached_{}_{}_{}_{}".format(
+            "dev" if evaluate else "train",
+            list(filter(None, model_name_or_path.split("/"))).pop(),
+            str(max_seq_length),
+            str(task),
+        ),
+    )
+    if os.path.exists(cached_features_file):
+        features = torch.load(cached_features_file)
+    else:
+        label_list = processor.get_labels()
+        if task in ["mnli",
+                    "mnli-mm"] and args.model_type in ["roberta",
+                                                       "xlmroberta"]:
+            # HACK(label indices are swapped in RoBERTa pretrained model)
+            label_list[1], label_list[2] = label_list[2], label_list[1]
+        examples = (
+            processor.get_dev_examples(
+                data_dir) if evaluate else processor.get_train_examples(
+                data_dir))
+        features = convert_examples_to_features(
+            examples,
+            tokenizer,
+            max_length=max_seq_length,
+            label_list=label_list,
+            output_mode=output_mode,
+        )
+        torch.save(features, cached_features_file)
+
+    # Convert to Tensors and build dataset
+    all_input_ids = torch.tensor(
+        [f.input_ids for f in features], dtype=torch.int32)
+    all_attention_mask = torch.tensor(
+        [f.attention_mask for f in features], dtype=torch.int32)
+    all_token_type_ids = torch.tensor(
+        [f.token_type_ids for f in features], dtype=torch.int32)
+    if output_mode == "classification":
+        all_labels = torch.tensor(
+            [f.label for f in features], dtype=torch.int32)
+    elif output_mode == "regression":
+        all_labels = torch.tensor(
+            [f.label for f in features], dtype=torch.float)
+
+    dataset = TensorDataset(
+        all_input_ids,
+        all_attention_mask,
+        all_token_type_ids,
+        all_labels)
+    return dataset
+
+def evaluate(model, tokenizer, params, prefix=""):
+    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    eval_task_names = ['qqp']
+    eval_outputs_dirs = './tmp'
+    results = {}
+    for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+        eval_dataset = load_and_cache_examples(
+            eval_task, tokenizer, evaluate=True)
+
+        if not os.path.exists(eval_output_dir):
+            os.makedirs(eval_output_dir)
+
+        # Note that DistributedSampler samples randomly
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            sampler=eval_sampler,
+            batch_size=32)
+
+        # Eval!
+        # print(f"***** Running evaluation {prefix} *****")
+        # print(f"  Num examples = {len(eval_dataset)}")
+        # print(f"  Batch size = {args.eval_batch_size}")
+        eval_loss = 0.0
+        nb_eval_steps = 0
+        preds = None
+        out_label_ids = None
+        loss = 0.0
+
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            batch = tuple(t for t in batch)
+
+            inputs = {
+                "input_ids": batch[0].numpy(),
+                "attention_mask": batch[1].numpy()}
+            inputs["position_ids"] = jnp.ones((32, max_seq_length), dtype=jnp.int32)
+            
+            inputs["token_type_ids"] = batch[2].numpy()
+                    # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+
+            outputs = model.apply(params, **inputs)
+            logits = outputs[0]
+            labels_data = batch[3].numpy() 
+            label_mask = jnp.where(labels_data > 0, 1.0, 0.0)
+            labels = jax.nn.one_hot(labels_data, logits.shape[-1])
+
+            loss = -jnp.sum(labels * jax.nn.log_softmax(logits, axis=-1),
+                            axis=-1)
+            loss = (label_mask * loss).sum() / label_mask.sum()
+
+        
+        from scipy.special import softmax
+
+        probs = softmax(preds, axis=-1)
+        entropy = jnp.exp((-probs * np.log(probs)).sum(axis=-1).mean())
+        preds = jnp.argmax(preds, axis=1)
+        # import pdb; pdb.set_trace()
+        # result = compute_metrics(eval_task, preds, out_label_ids)
+        # results.update(result)
+        results[eval_task] = (preds == out_label_ids).mean()
+        # if entropy is not None:
+        #     result["eval_avg_entropy"] = entropy
+
+        # output_eval_file = os.path.join(
+        #     eval_output_dir, prefix, "eval_results.txt")
+
+    return results
 
 def convert_from_pytorch(pt_state, config: BertConfig):
     jax_state = dict()
@@ -184,7 +324,10 @@ def test_bert_sparse():
     sparsified_params = load_from_pytorch_state(flattened_params, jax_state)
 
     params = convert_flattend_params(sparsified_params)
-    explore_params(params)
+    # explore_params(params)
+
+    token = BertTokenizer.from_pretrained('/home/shangyin/Research/SparTA/script/checkpoints/bert/checkpoints/finegrained/checkpoint-220000')
+    evaluate(model, token, params)
 
 if __name__ == "__main__":
     test_bert_sparse()
