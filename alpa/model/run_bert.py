@@ -164,12 +164,9 @@ def evaluate(model, tokenizer, params, prefix=""):
 
         flag = True
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
-            print
             if flag:
                 flag = False
-                print("Here")
                 s = jax_to_ir(eval_step, [("batch", batch)], constants={"apply_fn": model.apply}, format='HLO')[1]
-                print(s)
                 with open("jax_ir", "w") as f:
                     f.write(s)
             batch = tuple(t.numpy() for t in batch)
