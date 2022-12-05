@@ -115,6 +115,11 @@ class MeshHostWorker:
     def __init__(self, server_address: str, num_hosts: int, host_id: int,
                  mesh_id: int, move_worker: DaemonMoveWorker,
                  runtime_random_seed: int):
+        import sys
+        sys.path.insert(0, "/data/shangyin/Research/spalpa/spalpa/sparse/custom_calls")
+        import spmm
+        for _name, _value in spmm.registrations().items():
+            xla_client.register_custom_call_target(_name, _value, platform="gpu")
         self.num_hosts = num_hosts
         self.host_id = host_id
         self.mesh_id = mesh_id
